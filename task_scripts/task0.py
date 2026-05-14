@@ -32,30 +32,33 @@ def count_parameters(model):
     return total_params, trainable_params, ratio
 
 
-# 加载模型
-model = AutoModel.from_pretrained(
-    "/root/autodl-tmp/code/CS60004-LAB4-MLLM/data/models/InternVL2-2B/",
-    trust_remote_code=True,
-)
+if __name__ == "__main__":
+    from pathlib import Path
 
-configs = {
-    "A_connector_only": dict(
-        train_vision=False, train_connector=True, train_language=False
-    ),
-    "B_connector_language": dict(
-        train_vision=False, train_connector=True, train_language=True
-    ),
-    "C_vision_connector": dict(
-        train_vision=True, train_connector=True, train_language=False
-    ),
-    "D_full": dict(train_vision=True, train_connector=True, train_language=True),
-}
+    root = Path(__file__).resolve().parents[1]
+    model = AutoModel.from_pretrained(
+        str(root / "data/models/InternVL2-2B"),
+        trust_remote_code=True,
+    )
 
-for config_name, kwargs in configs.items():
-    set_trainable_modules(model, **kwargs)
-    total, trainable, ratio = count_parameters(model)
-    print(f"--- Configuration: {config_name} ---")
-    print(f"Total params: {total:,}")
-    print(f"Trainable params: {trainable:,}")
-    print(f"Trainable ratio: {ratio:.4f}%")
-    print("-" * 40)
+    configs = {
+        "A_connector_only": dict(
+            train_vision=False, train_connector=True, train_language=False
+        ),
+        "B_connector_language": dict(
+            train_vision=False, train_connector=True, train_language=True
+        ),
+        "C_vision_connector": dict(
+            train_vision=True, train_connector=True, train_language=False
+        ),
+        "D_full": dict(train_vision=True, train_connector=True, train_language=True),
+    }
+
+    for config_name, kwargs in configs.items():
+        set_trainable_modules(model, **kwargs)
+        total, trainable, ratio = count_parameters(model)
+        print(f"--- Configuration: {config_name} ---")
+        print(f"Total params: {total:,}")
+        print(f"Trainable params: {trainable:,}")
+        print(f"Trainable ratio: {ratio:.4f}%")
+        print("-" * 40)
