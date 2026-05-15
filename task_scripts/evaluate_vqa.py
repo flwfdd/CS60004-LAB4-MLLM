@@ -336,9 +336,8 @@ def main():
 
             results.append(
                 {
-                    "id": row.get("id"),
+                    **row,
                     "prediction": prediction,
-                    "answer": gold,
                     "correct": is_correct,
                     "has_bbox": has_bbox,
                 }

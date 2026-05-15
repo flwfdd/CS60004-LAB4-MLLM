@@ -29,6 +29,28 @@ def load_jsonl(path: Path) -> list[dict]:
         return [json.loads(line) for line in f if line.strip()]
 
 
+def load_mixed_train_rows(paths: list[str], max_samples: int) -> list[dict]:
+    """按 1:1:... 从多个 jsonl 取样"""
+    datasets = [load_jsonl(Path(p)) for p in paths]
+    n_src = len(datasets)
+    if n_src == 0:
+        raise ValueError("train_jsonl 不能为空")
+
+    total = max_samples if max_samples > 0 else min(map(len, datasets)) * n_src
+    base, rem = divmod(total, n_src)
+    quotas = [base + int(i < rem) for i in range(n_src)]
+    for path, rows, quota in zip(paths, datasets, quotas):
+        if len(rows) < quota:
+            raise ValueError(f"{path} 只有 {len(rows)} 条，不足以按比例取 {quota} 条。")
+
+    mixed = []
+    for j in range(max(quotas)):
+        for rows, quota in zip(datasets, quotas):
+            if j < quota:
+                mixed.append(rows[j])
+    return mixed
+
+
 def resolve_image(rel: str, image_root: Path) -> Path:
     return (image_root / rel.lstrip("/")).resolve()
 
@@ -54,6 +76,13 @@ def collate_micro_batch(
 
     pv_list, ids_list, mask_list, lbl_list = [], [], [], []
     for row in rows:
+        question = row.get("question", row.get("instruction"))
+        answer = row.get("answer", row.get("output"))
+        if question is None or answer is None:
+            raise KeyError(
+                "训练样本必须包含 question/answer 或 instruction/output 字段。"
+            )
+
         path = resolve_image(row["image"], image_root)
         if not path.is_file():
             raise FileNotFoundError(
@@ -66,8 +95,8 @@ def collate_micro_batch(
             tokenizer,
             model,
             num_patches=pv.shape[0],
-            question=row["question"],
-            answer=str(row["answer"]),
+            question=question,
+            answer=str(answer),
         )
         pv_list.append(pv)
         ids_list.append(ids.squeeze(0))
@@ -257,9 +286,7 @@ def train_one_config(
     accumulation_steps = cfg.batch_size // cfg.micro_batch_size
 
     total, trainable, ratio = count_parameters(model)
-    train_rows = load_jsonl(Path(cfg.train_jsonl))
-    if cfg.max_train_samples > 0:
-        train_rows = train_rows[: cfg.max_train_samples]
+    train_rows = load_mixed_train_rows(cfg.train_jsonl, cfg.max_train_samples)
 
     opt = torch.optim.AdamW(
         (p for p in model.parameters() if p.requires_grad), lr=cfg.lr, weight_decay=0.01
@@ -367,7 +394,6 @@ def train_one_config(
             pbar.set_postfix(
                 loss=f"{last_loss:.4f}",
                 optim=optim_step,
-                val=f"{last_val['accuracy']:.3f}" if last_val is not None else "n/a",
             )
 
             if micro_step % accumulation_steps == 0:
@@ -476,28 +502,34 @@ FREEZE_CONFIGS = {
 def main() -> None:
     cfg = SimpleNamespace(
         model_path=str(ROOT / "data/models/InternVL2-2B"),
-        # train_jsonl=str(ROOT / "data/mm_lab/data/task1/train.jsonl"),
-        train_jsonl=str(ROOT / "outputs/task1/hard_train.jsonl"),
-        val_jsonl=str(ROOT / "data/mm_lab/data/val.jsonl"),
-        output_dir=str(ROOT / "outputs/task1"),
+        train_jsonl=[
+            # str(ROOT / "data/mm_lab/data/task1/train.jsonl"),
+            str(ROOT / "outputs/task1/hard_train.jsonl"),
+            # str(ROOT / "outputs/task2/task2_A_text_teacher.jsonl"),
+            # str(ROOT / "outputs/task2/task2_B_vision_teacher.jsonl"),
+            # str(ROOT / "data/mm_lab/data/val.jsonl"),
+        ],
+        # val_jsonl=str(ROOT / "data/mm_lab/data/val.jsonl"),
+        val_jsonl=str(ROOT / "outputs/task1/hard_val.jsonl"),
+        output_dir=str(ROOT / "outputs/task2"),
         image_root=str(ROOT / "data/mm_lab"),
-        freeze_config="D_full",
+        freeze_config="B_connector_language",
         epochs=1,
-        lr=1e-5,
-        batch_size=64,
+        lr=1e-6,
+        batch_size=4,
         micro_batch_size=1,
-        max_train_samples=512,
+        max_train_samples=256,
         val_limit=0,  # 训练结束后最终评测条数，0全量
         eval_interval=0,  # 每多少次optim_step阶段性评测，0关闭
         eval_val_limit=100,  # 阶段性评测样本数
-        eval_batch_size=8,  # eval 并行样本数（InternVL2 batch_chat）
+        eval_batch_size=4,  # eval 并行样本数（InternVL2 batch_chat）
         eval_at_start=False,
         gradient_checkpointing=True,
-        max_new_tokens=16,
+        max_new_tokens=64,
         max_tiles=6,
         use_wandb=True,
         wandb_project="cs60004-lab4-mllm",
-        wandb_run_prefix="task1-hard",
+        wandb_run_prefix="task2-test",
     )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -512,7 +544,6 @@ def main() -> None:
     train_cfg = FREEZE_CONFIGS[name]
     image_root = Path(cfg.image_root).resolve()
 
-    print(f"\n========== {name} ==========")
     if cfg.use_wandb:
         import wandb
 
@@ -537,7 +568,7 @@ def main() -> None:
                 "max_new_tokens": cfg.max_new_tokens,
                 "max_tiles": cfg.max_tiles,
                 "model_path": cfg.model_path,
-                "train_jsonl": cfg.train_jsonl,
+                "train_jsonl": list(cfg.train_jsonl),
                 "val_jsonl": cfg.val_jsonl,
                 "image_root": cfg.image_root,
             },

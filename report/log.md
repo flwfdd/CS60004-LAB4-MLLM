@@ -162,3 +162,68 @@ Peak GPU memory: 21.65 GiB
 Train wall time: 293.5 s
 
 观察到 loss 一直有较大波动，最终效果并没有明显提升。
+
+用类似的方法构造 hard val 322 条。
+
+
+## Task 2
+
+bs 16 256张图片每张图片 8 条样本
+理论上2048条筛选后A1789条B1522条
+
+训练参数为bs 16 lr 5e-6 512 samples
+
+A：
+Answer Accuracy (val):                                                                             
+  total   = 0.6970 (n=1000)
+  bbox    = 0.6894 (n=937)
+  no_bbox = 0.8095 (n=63)
+Trainable: 2,205,754,368 / 2,205,754,368 (100.0000%)
+Peak GPU memory: 21.66 GiB
+Train wall time: 292.6 s
+
+B：
+Answer Accuracy (val):                                                                             
+  total   = 0.7020 (n=1000)
+  bbox    = 0.6937 (n=937)
+  no_bbox = 0.8254 (n=63)
+Trainable: 2,205,754,368 / 2,205,754,368 (100.0000%)
+Peak GPU memory: 21.66 GiB
+Train wall time: 297.9 s
+
+
+AB:
+Answer Accuracy (val):                                                                             
+  total   = 0.6920 (n=1000)
+  bbox    = 0.6841 (n=937)
+  no_bbox = 0.8095 (n=63)
+Trainable: 2,205,754,368 / 2,205,754,368 (100.0000%)
+Peak GPU memory: 21.66 GiB
+Train wall time: 297.4 s
+
+1A:
+Answer Accuracy (val):                                                                             
+  total   = 0.6980 (n=1000)
+  bbox    = 0.6884 (n=937)
+  no_bbox = 0.8413 (n=63)
+Trainable: 2,205,754,368 / 2,205,754,368 (100.0000%)
+Peak GPU memory: 21.66 GiB
+Train wall time: 296.7 s
+
+1B:
+Answer Accuracy (val):                                                                             
+  total   = 0.7000 (n=1000)
+  bbox    = 0.6905 (n=937)
+  no_bbox = 0.8413 (n=63)
+Trainable: 2,205,754,368 / 2,205,754,368 (100.0000%)
+Peak GPU memory: 21.66 GiB
+Train wall time: 300.9 s
+
+1AB bs32 lr1e-5 1024 samples:
+Answer Accuracy (val):                                                                             
+  total   = 0.6900 (n=1000)
+  bbox    = 0.6809 (n=937)
+  no_bbox = 0.8254 (n=63)
+Trainable: 2,205,754,368 / 2,205,754,368 (100.0000%)
+Peak GPU memory: 21.66 GiB
+Train wall time: 593.3 s

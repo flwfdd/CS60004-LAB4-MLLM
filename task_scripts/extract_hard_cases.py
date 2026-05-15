@@ -11,8 +11,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 PRED_PATH = ROOT / "outputs/task1/val_no_bbox.jsonl"
-SOURCE_PATH = ROOT / "data/mm_lab/data/task1/train.jsonl"
-OUTPUT_PATH = ROOT / "outputs/task1/hard_cases_train.jsonl"
+SOURCE_PATH = ROOT / "data/mm_lab/data/val.jsonl"
+OUTPUT_PATH = ROOT / "outputs/task1/hard_val.jsonl"
 
 
 def read_jsonl(path: Path) -> list[dict]:
