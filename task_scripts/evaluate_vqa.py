@@ -37,11 +37,13 @@ from __future__ import annotations
 import argparse
 import json
 import re
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
 import torch
 from PIL import Image
+from tqdm.auto import tqdm
 
 _PKG_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_IMAGE_ROOT = _PKG_ROOT / "data/mm_lab"
@@ -83,15 +85,67 @@ def exact_match(pred: str, gold: str) -> bool:
     return normalize(pred) == normalize(gold)
 
 
+def extract_prediction(text: str, mode: str) -> str:
+    text = text.strip()
+    if mode != "cot":
+        return text
+
+    matches = re.findall(r"Answer\s*[:：]\s*(.+)", text, flags=re.I)
+    if matches:
+        return matches[-1].splitlines()[0].strip().strip("\"'`.,。")
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    return lines[-1].strip("\"'`.,。") if lines else text
+
+
+def vote_predictions(raw_predictions: list[str], mode: str) -> tuple[str, list[str]]:
+    predictions = [extract_prediction(pred, mode) for pred in raw_predictions]
+    counts = Counter(normalize(pred) for pred in predictions)
+    best_norm, _ = counts.most_common(1)[0]
+    for pred in predictions:
+        if normalize(pred) == best_norm:
+            return pred, predictions
+    return predictions[0], predictions
+
+
 # ── Prompt 构造 ───────────────────────────────────────────────────────────────
 
 
 def build_prompt(row: dict[str, Any], mode: str, max_bboxes: int) -> str:
     question = row["question"].strip()
+    if mode == "cot":
+        prefix = ""
+        if row.get("bboxes"):
+            lines = ["Objects in the image:"]
+            for i, b in enumerate(row["bboxes"][:max_bboxes], start=1):
+                lines.append(f"{i}. {b['category']}: normalized_bbox={b['bbox']}")
+            prefix = "\n".join(lines) + "\n\n"
+        return (
+            f"{prefix}Question: {question}\n"
+            "Answer the question by reasoning briefly from the image and the "
+            "listed object bounding boxes (x_left_top, y_left_top, x_right_down, "
+            "y_right_down). Use the boxes only as localization clues; do not "
+            "invent new boxes. When an object is important to your reasoning path, "
+            "annotate it with its given bounding box. Do not mention the prompt or "
+            "say that the object information was provided. The final answer must "
+            "be a simple short answer, usually one word, a short phrase, yes/no, "
+            "or a number.\n"
+            "Your response should follow this format:\n"
+            "Thought: <brief reasoning process>\n"
+            "Answer: <short answer>"
+        )
     if mode == "bbox_prompt" and row.get("bboxes"):
         lines = ["Objects in the image:"]
         for i, b in enumerate(row["bboxes"][:max_bboxes], start=1):
             lines.append(f"{i}. {b['category']}: normalized_bbox={b['bbox']}")
+        bbox_ctx = "\n".join(lines)
+        return f"{bbox_ctx}\n\nQuestion: {question}\nAnswer with the shortest correct answer only."
+    if mode == "color_bbox_prompt" and row.get("bboxes"):
+        lines = ["Objects in the image:"]
+        for i, b in enumerate(row["bboxes"][:max_bboxes], start=1):
+            color = b.get("color", f"box {i}")
+            lines.append(
+                f"{i}. {color} box: {b['category']}, normalized_bbox={b['bbox']}"
+            )
         bbox_ctx = "\n".join(lines)
         return f"{bbox_ctx}\n\nQuestion: {question}\nAnswer with the shortest correct answer only."
     return f"Question: {question}\nAnswer with the shortest correct answer only."
@@ -198,6 +252,9 @@ class InternVL2Runner:
         image_paths: list[Path],
         prompts: list[str],
         max_new_tokens: int,
+        *,
+        do_sample: bool = False,
+        temperature: float = 0.7,
     ) -> list[str]:
         pv_list, num_patches_list = [], []
         for p in image_paths:
@@ -205,18 +262,35 @@ class InternVL2Runner:
             pv_list.append(pv)
             num_patches_list.append(pv.shape[0])
         pixel_values = torch.cat(pv_list, dim=0)
+        gen_cfg = dict(max_new_tokens=max_new_tokens, do_sample=do_sample)
+        if do_sample:
+            gen_cfg["temperature"] = temperature
         with torch.inference_mode():
             preds = self.model.batch_chat(
                 self.tokenizer,
                 pixel_values,
                 prompts,
-                dict(max_new_tokens=max_new_tokens, do_sample=False),
+                gen_cfg,
                 num_patches_list=num_patches_list,
             )
         return [p.strip() for p in preds]
 
-    def generate(self, image_path: Path, prompt: str, max_new_tokens: int) -> str:
-        return self.generate_batch([image_path], [prompt], max_new_tokens)[0]
+    def generate(
+        self,
+        image_path: Path,
+        prompt: str,
+        max_new_tokens: int,
+        *,
+        do_sample: bool = False,
+        temperature: float = 0.7,
+    ) -> str:
+        return self.generate_batch(
+            [image_path],
+            [prompt],
+            max_new_tokens,
+            do_sample=do_sample,
+            temperature=temperature,
+        )[0]
 
 
 class Qwen3VLRunner:
@@ -230,7 +304,15 @@ class Qwen3VLRunner:
         ).eval()
         self.processor = AutoProcessor.from_pretrained(model_path)
 
-    def generate(self, image_path: Path, prompt: str, max_new_tokens: int) -> str:
+    def generate(
+        self,
+        image_path: Path,
+        prompt: str,
+        max_new_tokens: int,
+        *,
+        do_sample: bool = False,
+        temperature: float = 0.7,
+    ) -> str:
         messages = [
             {
                 "role": "user",
@@ -247,10 +329,11 @@ class Qwen3VLRunner:
             return_dict=True,
             return_tensors="pt",
         ).to(self.model.device)
+        gen_cfg = dict(max_new_tokens=max_new_tokens, do_sample=do_sample)
+        if do_sample:
+            gen_cfg["temperature"] = temperature
         with torch.inference_mode():
-            ids = self.model.generate(
-                **inputs, max_new_tokens=max_new_tokens, do_sample=False
-            )
+            ids = self.model.generate(**inputs, **gen_cfg)
         trimmed = [o[len(i) :] for i, o in zip(inputs.input_ids, ids)]
         return self.processor.batch_decode(
             trimmed,
@@ -267,11 +350,18 @@ def main():
     parser.add_argument("--model", choices=["internvl2", "qwen3vl"], required=True)
     parser.add_argument("--model-path", required=True, help="模型本地路径")
     parser.add_argument("--dataset", type=Path, required=True, help="输入 jsonl 文件")
-    parser.add_argument("--mode", choices=["no_bbox", "bbox_prompt"], required=True)
+    parser.add_argument(
+        "--mode",
+        choices=["no_bbox", "bbox_prompt", "color_bbox_prompt", "cot"],
+        required=True,
+    )
     parser.add_argument("--output", type=Path, required=True, help="输出 jsonl 文件")
     parser.add_argument("--limit", type=int, default=0, help="调试用：只跑前 N 条")
     parser.add_argument("--max-new-tokens", type=int, default=16)
     parser.add_argument("--max-bboxes", type=int, default=12)
+    parser.add_argument("--num-repeats", type=int, default=1)
+    parser.add_argument("--repeat-do-sample", action="store_true")
+    parser.add_argument("--temperature", type=float, default=0.7)
     parser.add_argument(
         "--max-tiles", type=int, default=6, help="InternVL2 动态分辨率最大 tile 数"
     )
@@ -294,6 +384,8 @@ def main():
     rows = read_jsonl(args.dataset)
     if args.limit > 0:
         rows = rows[: args.limit]
+    if args.num_repeats < 1:
+        raise ValueError("--num-repeats must be >= 1")
 
     if args.model == "internvl2":
         runner = InternVL2Runner(args.model_path, args.max_tiles)
@@ -305,20 +397,41 @@ def main():
     n_total = n_bbox = n_no = 0
     # InternVL2 用 batch_chat 并行；Qwen3-VL 暂时仅支持单条
     bs = max(int(args.eval_batch_size), 1) if args.model == "internvl2" else 1
-    done = 0
+    pbar = tqdm(
+        total=len(rows),
+        desc=f"eval",
+        dynamic_ncols=True,
+    )
     for start in range(0, len(rows), bs):
         chunk = rows[start : start + bs]
         prompts = [build_prompt(r, args.mode, args.max_bboxes) for r in chunk]
         paths = [resolve_image(r["image"], image_root) for r in chunk]
-        if args.model == "internvl2":
-            preds = runner.generate_batch(paths, prompts, args.max_new_tokens)
-        else:
-            preds = [
-                runner.generate(p, q, args.max_new_tokens)
-                for p, q in zip(paths, prompts)
-            ]
+        raw_by_sample = [[] for _ in chunk]
+        for _ in range(args.num_repeats):
+            if args.model == "internvl2":
+                preds = runner.generate_batch(
+                    paths,
+                    prompts,
+                    args.max_new_tokens,
+                    do_sample=args.repeat_do_sample,
+                    temperature=args.temperature,
+                )
+            else:
+                preds = [
+                    runner.generate(
+                        p,
+                        q,
+                        args.max_new_tokens,
+                        do_sample=args.repeat_do_sample,
+                        temperature=args.temperature,
+                    )
+                    for p, q in zip(paths, prompts)
+                ]
+            for raw_list, pred in zip(raw_by_sample, preds):
+                raw_list.append(pred)
 
-        for row, prediction in zip(chunk, preds):
+        for row, raw_predictions in zip(chunk, raw_by_sample):
+            prediction, prediction_votes = vote_predictions(raw_predictions, args.mode)
             gold = row.get("answer")
             is_correct = (
                 exact_match(prediction, str(gold)) if gold is not None else None
@@ -338,26 +451,28 @@ def main():
                 {
                     **row,
                     "prediction": prediction,
+                    "raw_prediction": raw_predictions[0],
+                    "raw_predictions": raw_predictions,
+                    "prediction_votes": prediction_votes,
                     "correct": is_correct,
                     "has_bbox": has_bbox,
                 }
             )
-        done += len(chunk)
-        if done % 50 < bs or done == len(rows):
-            tot = f"{correct_total/n_total:.3f}" if n_total else "n/a"
-            bb = f"{correct_bbox/n_bbox:.3f}" if n_bbox else "n/a"
-            nb = f"{correct_no/n_no:.3f}" if n_no else "n/a"
-            print(
-                f"[{done}/{len(rows)}] total={tot} bbox={bb} no_bbox={nb}", flush=True
-            )
+        pbar.update(len(chunk))
+        pbar.set_postfix(
+            total=f"{correct_total/n_total:.3f}" if n_total else "n/a",
+            bbox=f"{correct_bbox/n_bbox:.3f}" if n_bbox else "n/a",
+            no_bbox=f"{correct_no/n_no:.3f}" if n_no else "n/a",
+            refresh=False,
+        )
+    pbar.close()
 
     write_jsonl(args.output, results)
     print(f"\nSaved {len(results)} predictions → {args.output}")
     if n_total:
+
         def _line(name: str, c: int, n: int) -> str:
-            return (
-                f"  {name:8s}: {c}/{n} = {c / n:.4f}" if n else f"  {name:8s}: n/a"
-            )
+            return f"  {name:8s}: {c}/{n} = {c / n:.4f}" if n else f"  {name:8s}: n/a"
 
         print("Answer Accuracy:")
         print(_line("total", correct_total, n_total))

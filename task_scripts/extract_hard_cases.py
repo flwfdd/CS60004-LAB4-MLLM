@@ -6,13 +6,15 @@
 from __future__ import annotations
 
 import json
+import random
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 
-PRED_PATH = ROOT / "outputs/task1/val_no_bbox.jsonl"
-SOURCE_PATH = ROOT / "data/mm_lab/data/val.jsonl"
-OUTPUT_PATH = ROOT / "outputs/task1/hard_val.jsonl"
+PRED_PATH = ROOT / "outputs/task3/train_internvl2_bbox_prompt.jsonl"
+SOURCE_PATH = ROOT / "data/mm_lab/data/task3/train_with_bbox.jsonl"
+OUTPUT_PATH = ROOT / "outputs/task3/hard_train.jsonl"
+SHUFFLE = True
 
 
 def read_jsonl(path: Path) -> list[dict]:
@@ -26,6 +28,9 @@ def main() -> None:
 
     wrong_ids = [str(p["id"]) for p in preds if p.get("correct") is False]
     rows = [source_by_id[i] for i in wrong_ids if i in source_by_id]
+
+    if SHUFFLE:
+        random.shuffle(rows)
 
     OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
     with OUTPUT_PATH.open("w", encoding="utf-8") as f:

@@ -69,6 +69,8 @@ def collate_micro_batch(
     image_root: Path,
     *,
     max_tiles: int,
+    prompt_mode: str,
+    max_bboxes: int,
     device: torch.device,
 ) -> tuple[torch.Tensor, ...]:
     """把若干条样本拼成一个 micro-batch；右侧填充 input_ids / attention_mask / labels。"""
@@ -76,12 +78,10 @@ def collate_micro_batch(
 
     pv_list, ids_list, mask_list, lbl_list = [], [], [], []
     for row in rows:
-        question = row.get("question", row.get("instruction"))
-        answer = row.get("answer", row.get("output"))
+        question = row.get("question")
+        answer = row.get("answer")
         if question is None or answer is None:
-            raise KeyError(
-                "训练样本必须包含 question/answer 或 instruction/output 字段。"
-            )
+            raise KeyError("训练样本必须包含 question/answer 字段。")
 
         path = resolve_image(row["image"], image_root)
         if not path.is_file():
@@ -95,7 +95,7 @@ def collate_micro_batch(
             tokenizer,
             model,
             num_patches=pv.shape[0],
-            question=question,
+            prompt=build_prompt(row, prompt_mode, max_bboxes=max_bboxes),
             answer=str(answer),
         )
         pv_list.append(pv)
@@ -113,13 +113,9 @@ def collate_micro_batch(
 
 
 def tokenize_sft(
-    tokenizer, model, num_patches: int, question: str, answer: str
+    tokenizer, model, num_patches: int, prompt: str, answer: str
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    vqa = (
-        f"Question: {question.strip()}\n"
-        "Answer with the shortest correct answer only."
-    )
-    user_msg = f"<image>\n{vqa}"
+    user_msg = f"<image>\n{prompt.strip()}"
     template = get_conv_template(model.template)
     template.system_message = model.system_message
     template.append_message(template.roles[0], user_msg)
@@ -156,6 +152,8 @@ def val_accuracy(
     max_tiles: int,
     limit: int,
     max_new_tokens: int,
+    prompt_mode: str,
+    max_bboxes: int,
     batch_size: int = 1,
     desc: str = "eval",
 ) -> dict:
@@ -184,7 +182,7 @@ def val_accuracy(
             ).to(device=device, dtype=torch.bfloat16)
             pv_list.append(pv)
             num_patches_list.append(pv.shape[0])
-            questions.append(build_prompt(row, "no_bbox", max_bboxes=12))
+            questions.append(build_prompt(row, prompt_mode, max_bboxes=max_bboxes))
 
         pixel_values = torch.cat(pv_list, dim=0)
         preds = [
@@ -317,6 +315,8 @@ def train_one_config(
             max_tiles=cfg.max_tiles,
             limit=n_samples,
             max_new_tokens=cfg.max_new_tokens,
+            prompt_mode=cfg.prompt_mode,
+            max_bboxes=cfg.max_bboxes,
             batch_size=cfg.eval_batch_size,
             desc=f"eval[{tag}@{at_optim_step}]",
         )
@@ -375,6 +375,8 @@ def train_one_config(
                 model,
                 image_root,
                 max_tiles=cfg.max_tiles,
+                prompt_mode=cfg.prompt_mode,
+                max_bboxes=cfg.max_bboxes,
                 device=device,
             )
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
@@ -431,6 +433,8 @@ def train_one_config(
         max_tiles=cfg.max_tiles,
         limit=val_n,
         max_new_tokens=cfg.max_new_tokens,
+        prompt_mode=cfg.prompt_mode,
+        max_bboxes=cfg.max_bboxes,
         batch_size=cfg.eval_batch_size,
         desc="eval[final]",
     )
@@ -459,6 +463,8 @@ def train_one_config(
         "val_samples_no_bbox": final_metrics["n_no_bbox"],
         "batch_size": cfg.batch_size,
         "micro_batch_size": cfg.micro_batch_size,
+        "prompt_mode": cfg.prompt_mode,
+        "max_bboxes": cfg.max_bboxes,
         "optim_steps": optim_step,
         "micro_steps": micro_step,
     }
@@ -500,36 +506,67 @@ FREEZE_CONFIGS = {
 
 
 def main() -> None:
+    # Task3 visual experiment configs:
+    # 1) same_box:
+    #    train_jsonl = outputs/task3/visual_data/same_box/train.jsonl
+    #    val_jsonl   = outputs/task3/visual_data/same_box/val.jsonl
+    #    image_root  = ROOT
+    #    prompt_mode = "no_bbox"
+    # 2) color_box:
+    #    train_jsonl = outputs/task3/visual_data/color_box/train.jsonl
+    #    val_jsonl   = outputs/task3/visual_data/color_box/val.jsonl
+    #    image_root  = ROOT
+    #    prompt_mode = "no_bbox"
+    # 3) color_box_label:
+    #    train_jsonl = outputs/task3/visual_data/color_box_label/train.jsonl
+    #    val_jsonl   = outputs/task3/visual_data/color_box_label/val.jsonl
+    #    image_root  = ROOT
+    #    prompt_mode = "no_bbox"
+    # 4) same_box_bbox_prompt:
+    #    train_jsonl = outputs/task3/visual_data/same_box/train.jsonl
+    #    val_jsonl   = outputs/task3/visual_data/same_box/val.jsonl
+    #    image_root  = ROOT
+    #    prompt_mode = "bbox_prompt"
+    # 5) color_box_color_prompt:
+    #    train_jsonl = outputs/task3/visual_data/color_box/train.jsonl
+    #    val_jsonl   = outputs/task3/visual_data/color_box/val.jsonl
+    #    image_root  = ROOT
+    #    prompt_mode = "color_bbox_prompt"
     cfg = SimpleNamespace(
-        model_path=str(ROOT / "data/models/InternVL2-2B"),
+        # model_path=str(ROOT / "data/models/InternVL2-2B"),
+        model_path=str(ROOT / "outputs/task1/D_full"),
         train_jsonl=[
             # str(ROOT / "data/mm_lab/data/task1/train.jsonl"),
-            str(ROOT / "outputs/task1/hard_train.jsonl"),
+            # str(ROOT / "outputs/task1/hard_train.jsonl"),
             # str(ROOT / "outputs/task2/task2_A_text_teacher.jsonl"),
             # str(ROOT / "outputs/task2/task2_B_vision_teacher.jsonl"),
             # str(ROOT / "data/mm_lab/data/val.jsonl"),
+            str(ROOT / "data/mm_lab/data/task3/train_with_bbox.jsonl"),
+            # str(ROOT / "outputs/task3/hard_train.jsonl"),
         ],
-        # val_jsonl=str(ROOT / "data/mm_lab/data/val.jsonl"),
-        val_jsonl=str(ROOT / "outputs/task1/hard_val.jsonl"),
-        output_dir=str(ROOT / "outputs/task2"),
+        val_jsonl=str(ROOT / "data/mm_lab/data/val.jsonl"),
+        # val_jsonl=str(ROOT / "outputs/task1/hard_val.jsonl"),
+        output_dir=str(ROOT / "outputs/task1"),
         image_root=str(ROOT / "data/mm_lab"),
-        freeze_config="B_connector_language",
+        freeze_config="D_full",
         epochs=1,
-        lr=1e-6,
-        batch_size=4,
+        lr=2e-5,
+        batch_size=64,
         micro_batch_size=1,
-        max_train_samples=256,
+        max_train_samples=0,
         val_limit=0,  # 训练结束后最终评测条数，0全量
-        eval_interval=0,  # 每多少次optim_step阶段性评测，0关闭
+        eval_interval=10,  # 每多少次optim_step阶段性评测，0关闭
         eval_val_limit=100,  # 阶段性评测样本数
-        eval_batch_size=4,  # eval 并行样本数（InternVL2 batch_chat）
-        eval_at_start=False,
+        eval_batch_size=4,  # eval 并行样本数
+        eval_at_start=True,
         gradient_checkpointing=True,
         max_new_tokens=64,
         max_tiles=6,
+        prompt_mode="bbox_prompt",  # no_bbox, bbox_prompt, color_bbox_prompt
+        max_bboxes=12,
         use_wandb=True,
         wandb_project="cs60004-lab4-mllm",
-        wandb_run_prefix="task2-test",
+        wandb_run_prefix="task3-hard",
     )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -567,6 +604,8 @@ def main() -> None:
                 "gradient_checkpointing": cfg.gradient_checkpointing,
                 "max_new_tokens": cfg.max_new_tokens,
                 "max_tiles": cfg.max_tiles,
+                "prompt_mode": cfg.prompt_mode,
+                "max_bboxes": cfg.max_bboxes,
                 "model_path": cfg.model_path,
                 "train_jsonl": list(cfg.train_jsonl),
                 "val_jsonl": cfg.val_jsonl,

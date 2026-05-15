@@ -65,11 +65,11 @@ Allowed task types:
 {TASK_TYPE_BLOCK}
 
 Requirements:
-1. Output a JSON array. Each item must contain task_type, instruction, and output.
+1. Output a JSON array. Each item must contain task_type, question, and answer.
 2. task_type must be one of the allowed task types above. Prefer diverse task types but do not invent new types.
-3. instruction and output must be in English.
-4. For object_recognition, object_counting, and spatial_reasoning, write the instruction as a visual question answering question and make the output a short answer, usually one word, a short phrase, yes/no, or a number.
-5. The final instruction must not contain bbox coordinates or bbox lists.
+3. question and answer must be in English.
+4. For object_recognition, object_counting, and spatial_reasoning, write question as a visual question answering question and make answer a short answer, usually one word, a short phrase, yes/no, or a number.
+5. The final question must not contain bbox coordinates or bbox lists.
 6. Output JSON only. Do not add explanations."""
 
 
@@ -84,11 +84,11 @@ Allowed task types:
 {TASK_TYPE_BLOCK}
 
 Requirements:
-1. Output a JSON array. Each item must contain task_type, instruction, and output.
+1. Output a JSON array. Each item must contain task_type, question, and answer.
 2. task_type must be one of the allowed task types above. Prefer diverse task types but do not invent new types.
-3. instruction and output must be in English.
-4. For object_recognition, object_counting, and spatial_reasoning, write the instruction as a visual question answering question and make the output a short answer, usually one word, a short phrase, yes/no, or a number.
-5. The final instruction must not contain bbox coordinates or bbox lists.
+3. question and answer must be in English.
+4. For object_recognition, object_counting, and spatial_reasoning, write question as a visual question answering question and make answer a short answer, usually one word, a short phrase, yes/no, or a number.
+5. The final question must not contain bbox coordinates or bbox lists.
 6. Output JSON only. Do not add explanations."""
 
 
@@ -151,8 +151,8 @@ def clean_items(items: list[dict]) -> list[dict]:
     seen = set()
     bad_pattern = re.compile(r"bbox|bounding box|\[[0-9.,\s]+\]|x_min|y_min", re.I)
     for item in items:
-        inst = str(item.get("instruction", "")).strip()
-        out = str(item.get("output", "")).strip()
+        inst = str(item.get("question", "")).strip()
+        out = str(item.get("answer", "")).strip()
         task_type = str(item.get("task_type", "")).strip()
         if task_type not in TASK_TYPES:
             continue
@@ -162,9 +162,7 @@ def clean_items(items: list[dict]) -> list[dict]:
         if key in seen:
             continue
         seen.add(key)
-        rows.append(
-            {"task_type": task_type, "instruction": inst, "input": "", "output": out}
-        )
+        rows.append({"task_type": task_type, "question": inst, "answer": out})
     return rows[:SAMPLES_PER_IMAGE]
 
 
