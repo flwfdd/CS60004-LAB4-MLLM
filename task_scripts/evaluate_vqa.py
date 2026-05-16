@@ -39,9 +39,10 @@ import json
 import re
 from collections import Counter
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, cast
 
 import torch
+from torch.utils.data import DataLoader, Dataset
 from PIL import Image
 from tqdm.auto import tqdm
 
@@ -111,6 +112,7 @@ def vote_predictions(raw_predictions: list[str], mode: str) -> tuple[str, list[s
 
 
 def build_prompt(row: dict[str, Any], mode: str, max_bboxes: int) -> str:
+    format_prompt = "The answer must be a simple short answer, usually one word, a short phrase, yes/no, or a number."
     question = row["question"].strip()
     if mode == "cot":
         prefix = ""
@@ -126,9 +128,7 @@ def build_prompt(row: dict[str, Any], mode: str, max_bboxes: int) -> str:
             "y_right_down). Use the boxes only as localization clues; do not "
             "invent new boxes. When an object is important to your reasoning path, "
             "annotate it with its given bounding box. Do not mention the prompt or "
-            "say that the object information was provided. The final answer must "
-            "be a simple short answer, usually one word, a short phrase, yes/no, "
-            "or a number.\n"
+            f"say that the object information was provided. {format_prompt}\n"
             "Your response should follow this format:\n"
             "Thought: <brief reasoning process>\n"
             "Answer: <short answer>"
@@ -138,7 +138,14 @@ def build_prompt(row: dict[str, Any], mode: str, max_bboxes: int) -> str:
         for i, b in enumerate(row["bboxes"][:max_bboxes], start=1):
             lines.append(f"{i}. {b['category']}: normalized_bbox={b['bbox']}")
         bbox_ctx = "\n".join(lines)
-        return f"{bbox_ctx}\n\nQuestion: {question}\nAnswer with the shortest correct answer only."
+        return f"{bbox_ctx}\n\nQuestion: {question}\nAnswer with the shortest correct answer only. {format_prompt}"
+    if mode == "color_prompt" and row.get("bboxes"):
+        lines = ["Objects in the image:"]
+        for i, b in enumerate(row["bboxes"][:max_bboxes], start=1):
+            color = b.get("color", f"box {i}")
+            lines.append(f"{i}. {color} box: {b['category']}")
+        bbox_ctx = "\n".join(lines)
+        return f"{bbox_ctx}\n\nQuestion: {question}\nAnswer with the shortest correct answer only. {format_prompt}"
     if mode == "color_bbox_prompt" and row.get("bboxes"):
         lines = ["Objects in the image:"]
         for i, b in enumerate(row["bboxes"][:max_bboxes], start=1):
@@ -147,8 +154,8 @@ def build_prompt(row: dict[str, Any], mode: str, max_bboxes: int) -> str:
                 f"{i}. {color} box: {b['category']}, normalized_bbox={b['bbox']}"
             )
         bbox_ctx = "\n".join(lines)
-        return f"{bbox_ctx}\n\nQuestion: {question}\nAnswer with the shortest correct answer only."
-    return f"Question: {question}\nAnswer with the shortest correct answer only."
+        return f"{bbox_ctx}\n\nQuestion: {question}\nAnswer with the shortest correct answer only. {format_prompt}"
+    return f"Question: {question}\nAnswer with the shortest correct answer only. {format_prompt}"
 
 
 # ── InternVL2 动态分辨率 tile ────────
@@ -181,7 +188,9 @@ def internvl_dynamic_tile_pixel_values(
     max_tiles: int = 6,
     image_size: int = 448,
 ) -> torch.Tensor:
-    transform = _internvl_tile_transform(image_size)
+    transform = cast(
+        Callable[[Image.Image], torch.Tensor], _internvl_tile_transform(image_size)
+    )
     w, h = image.size
     ratio = w / h
     sz = image_size
@@ -213,6 +222,66 @@ def internvl_dynamic_tile_pixel_values(
     return torch.stack([transform(t) for t in tiles])
 
 
+def internvl_tile_image_file(
+    image_path: Path,
+    *,
+    max_tiles: int,
+    image_size: int = 448,
+) -> torch.Tensor:
+    image = Image.open(image_path).convert("RGB")
+    return internvl_dynamic_tile_pixel_values(
+        image,
+        max_tiles=max_tiles,
+        image_size=image_size,
+    ).to(dtype=torch.bfloat16)
+
+
+class InternVL2EvalDataset(Dataset):
+    def __init__(
+        self,
+        rows: list[dict[str, Any]],
+        *,
+        image_root: Path,
+        mode: str,
+        max_bboxes: int,
+        max_tiles: int,
+        image_size: int = 448,
+    ):
+        self.rows = rows
+        self.image_root = image_root
+        self.mode = mode
+        self.max_bboxes = max_bboxes
+        self.max_tiles = max_tiles
+        self.image_size = image_size
+
+    def __len__(self) -> int:
+        return len(self.rows)
+
+    def __getitem__(self, idx: int) -> dict[str, Any]:
+        row = self.rows[idx]
+        image_path = resolve_image(row["image"], self.image_root)
+        pixel_values = internvl_tile_image_file(
+            image_path,
+            max_tiles=self.max_tiles,
+            image_size=self.image_size,
+        )
+        return {
+            "row": row,
+            "prompt": build_prompt(row, self.mode, self.max_bboxes),
+            "pixel_values": pixel_values,
+            "num_patches": pixel_values.shape[0],
+        }
+
+
+def collate_internvl2_eval_batch(items: list[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        "rows": [item["row"] for item in items],
+        "prompts": [item["prompt"] for item in items],
+        "pixel_values": torch.cat([item["pixel_values"] for item in items], dim=0),
+        "num_patches_list": [item["num_patches"] for item in items],
+    }
+
+
 # ── 模型封装 ──────────────────────────────────────────────────────────────────
 
 
@@ -226,9 +295,9 @@ class InternVL2Runner:
             AutoModel.from_pretrained(
                 model_path,
                 torch_dtype=torch.bfloat16,
-                low_cpu_mem_usage=True,
+                low_cpu_mem_usage=False,
                 trust_remote_code=True,
-                use_flash_attn=False,
+                use_flash_attn=True,
             )
             .eval()
             .cuda()
@@ -247,6 +316,32 @@ class InternVL2Runner:
             .cuda()
         )
 
+    def generate_preprocessed_batch(
+        self,
+        pixel_values: torch.Tensor,
+        num_patches_list: list[int],
+        prompts: list[str],
+        max_new_tokens: int,
+        *,
+        do_sample: bool = False,
+        temperature: float = 0.7,
+    ) -> list[str]:
+        pixel_values = pixel_values.cuda(non_blocking=True)
+        gen_cfg: dict[str, Any] = dict(
+            max_new_tokens=max_new_tokens, do_sample=do_sample
+        )
+        if do_sample:
+            gen_cfg["temperature"] = temperature
+        with torch.inference_mode():
+            preds = self.model.batch_chat(
+                self.tokenizer,
+                pixel_values,
+                prompts,
+                gen_cfg,
+                num_patches_list=num_patches_list,
+            )
+        return [p.strip() for p in preds]
+
     def generate_batch(
         self,
         image_paths: list[Path],
@@ -262,18 +357,14 @@ class InternVL2Runner:
             pv_list.append(pv)
             num_patches_list.append(pv.shape[0])
         pixel_values = torch.cat(pv_list, dim=0)
-        gen_cfg = dict(max_new_tokens=max_new_tokens, do_sample=do_sample)
-        if do_sample:
-            gen_cfg["temperature"] = temperature
-        with torch.inference_mode():
-            preds = self.model.batch_chat(
-                self.tokenizer,
-                pixel_values,
-                prompts,
-                gen_cfg,
-                num_patches_list=num_patches_list,
-            )
-        return [p.strip() for p in preds]
+        return self.generate_preprocessed_batch(
+            pixel_values,
+            num_patches_list,
+            prompts,
+            max_new_tokens,
+            do_sample=do_sample,
+            temperature=temperature,
+        )
 
     def generate(
         self,
@@ -329,7 +420,9 @@ class Qwen3VLRunner:
             return_dict=True,
             return_tensors="pt",
         ).to(self.model.device)
-        gen_cfg = dict(max_new_tokens=max_new_tokens, do_sample=do_sample)
+        gen_cfg: dict[str, Any] = dict(
+            max_new_tokens=max_new_tokens, do_sample=do_sample
+        )
         if do_sample:
             gen_cfg["temperature"] = temperature
         with torch.inference_mode():
@@ -352,7 +445,7 @@ def main():
     parser.add_argument("--dataset", type=Path, required=True, help="输入 jsonl 文件")
     parser.add_argument(
         "--mode",
-        choices=["no_bbox", "bbox_prompt", "color_bbox_prompt", "cot"],
+        choices=["no_bbox", "bbox_prompt", "color_prompt", "color_bbox_prompt", "cot"],
         required=True,
     )
     parser.add_argument("--output", type=Path, required=True, help="输出 jsonl 文件")
@@ -372,6 +465,25 @@ def main():
         help="InternVL2 评测并行样本数（batch_chat），Qwen3-VL 暂时仅支持 1",
     )
     parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=4,
+        help="InternVL2 图片预处理 DataLoader worker 数；设为 0 则关闭并行预处理",
+    )
+    parser.add_argument(
+        "--prefetch-factor",
+        type=int,
+        default=2,
+        help="每个 worker 预取 batch 数，仅在 --num-workers > 0 时生效",
+    )
+    parser.add_argument(
+        "--no-pin-memory",
+        dest="pin_memory",
+        action="store_false",
+        help="关闭 DataLoader pin_memory；默认开启以加速 CPU 到 GPU 拷贝",
+    )
+    parser.set_defaults(pin_memory=True)
+    parser.add_argument(
         "--image-root",
         type=Path,
         default=DEFAULT_IMAGE_ROOT,
@@ -387,49 +499,15 @@ def main():
     if args.num_repeats < 1:
         raise ValueError("--num-repeats must be >= 1")
 
-    if args.model == "internvl2":
-        runner = InternVL2Runner(args.model_path, args.max_tiles)
-    else:
-        runner = Qwen3VLRunner(args.model_path)
-
     results = []
     correct_total = correct_bbox = correct_no = 0
     n_total = n_bbox = n_no = 0
-    # InternVL2 用 batch_chat 并行；Qwen3-VL 暂时仅支持单条
-    bs = max(int(args.eval_batch_size), 1) if args.model == "internvl2" else 1
-    pbar = tqdm(
-        total=len(rows),
-        desc=f"eval",
-        dynamic_ncols=True,
-    )
-    for start in range(0, len(rows), bs):
-        chunk = rows[start : start + bs]
-        prompts = [build_prompt(r, args.mode, args.max_bboxes) for r in chunk]
-        paths = [resolve_image(r["image"], image_root) for r in chunk]
-        raw_by_sample = [[] for _ in chunk]
-        for _ in range(args.num_repeats):
-            if args.model == "internvl2":
-                preds = runner.generate_batch(
-                    paths,
-                    prompts,
-                    args.max_new_tokens,
-                    do_sample=args.repeat_do_sample,
-                    temperature=args.temperature,
-                )
-            else:
-                preds = [
-                    runner.generate(
-                        p,
-                        q,
-                        args.max_new_tokens,
-                        do_sample=args.repeat_do_sample,
-                        temperature=args.temperature,
-                    )
-                    for p, q in zip(paths, prompts)
-                ]
-            for raw_list, pred in zip(raw_by_sample, preds):
-                raw_list.append(pred)
 
+    def _record_batch(
+        chunk: list[dict[str, Any]],
+        raw_by_sample: list[list[str]],
+    ) -> None:
+        nonlocal correct_total, correct_bbox, correct_no, n_total, n_bbox, n_no
         for row, raw_predictions in zip(chunk, raw_by_sample):
             prediction, prediction_votes = vote_predictions(raw_predictions, args.mode)
             gold = row.get("answer")
@@ -458,13 +536,77 @@ def main():
                     "has_bbox": has_bbox,
                 }
             )
-        pbar.update(len(chunk))
+
+    def _update_progress(chunk_size: int) -> None:
+        pbar.update(chunk_size)
         pbar.set_postfix(
             total=f"{correct_total/n_total:.3f}" if n_total else "n/a",
             bbox=f"{correct_bbox/n_bbox:.3f}" if n_bbox else "n/a",
             no_bbox=f"{correct_no/n_no:.3f}" if n_no else "n/a",
             refresh=False,
         )
+
+    pbar = tqdm(
+        total=len(rows),
+        desc=f"eval",
+        dynamic_ncols=True,
+    )
+    if args.model == "internvl2":
+        runner = InternVL2Runner(args.model_path, args.max_tiles)
+        bs = max(int(args.eval_batch_size), 1)
+        num_workers = max(int(args.num_workers), 0)
+        loader_kwargs: dict[str, Any] = dict(
+            batch_size=bs,
+            shuffle=False,
+            num_workers=num_workers,
+            collate_fn=collate_internvl2_eval_batch,
+            pin_memory=bool(args.pin_memory),
+        )
+        if num_workers > 0:
+            loader_kwargs["prefetch_factor"] = max(int(args.prefetch_factor), 1)
+            loader_kwargs["persistent_workers"] = True
+        dataset = InternVL2EvalDataset(
+            rows,
+            image_root=image_root,
+            mode=args.mode,
+            max_bboxes=args.max_bboxes,
+            max_tiles=args.max_tiles,
+            image_size=runner.image_size,
+        )
+        loader = DataLoader(dataset, **loader_kwargs)
+        for batch in loader:
+            chunk = batch["rows"]
+            raw_by_sample = [[] for _ in chunk]
+            for _ in range(args.num_repeats):
+                preds = runner.generate_preprocessed_batch(
+                    batch["pixel_values"],
+                    batch["num_patches_list"],
+                    batch["prompts"],
+                    args.max_new_tokens,
+                    do_sample=args.repeat_do_sample,
+                    temperature=args.temperature,
+                )
+                for raw_list, pred in zip(raw_by_sample, preds):
+                    raw_list.append(pred)
+            _record_batch(chunk, raw_by_sample)
+            _update_progress(len(chunk))
+    else:
+        runner = Qwen3VLRunner(args.model_path)
+        for row in rows:
+            prompt = build_prompt(row, args.mode, args.max_bboxes)
+            path = resolve_image(row["image"], image_root)
+            raw_predictions = [
+                runner.generate(
+                    path,
+                    prompt,
+                    args.max_new_tokens,
+                    do_sample=args.repeat_do_sample,
+                    temperature=args.temperature,
+                )
+                for _ in range(args.num_repeats)
+            ]
+            _record_batch([row], [raw_predictions])
+            _update_progress(1)
     pbar.close()
 
     write_jsonl(args.output, results)

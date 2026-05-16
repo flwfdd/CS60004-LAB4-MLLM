@@ -421,4 +421,183 @@ Answer Accuracy:
 
 直接把 task1/D_full 交了一发。	77.5	581	排名第二。
 
+bs 32 lr 5e-6 bbox 8000
+Answer Accuracy (val):                                                                 
+  total   = 0.8880 (n=1000)
+  bbox    = 0.8911 (n=937)
+  no_bbox = 0.8413 (n=63)
+Trainable: 2,205,754,368 / 2,205,754,368 (100.0000%)
+Peak GPU memory: 30.30 GiB
+Train wall time: 8259.6 s
 
+bs 128 lr 4e-5 bbox 8000
+train[D_full]: 100%|██████| 8000/8000 [1:10:07<00:00,  1.90it/s, loss=0.0244, optim=62]
+Answer Accuracy (val):                                                                 
+  total   = 0.8350 (n=1000)
+  bbox    = 0.8367 (n=937)
+  no_bbox = 0.8095 (n=63)
+Trainable: 2,205,754,368 / 2,205,754,368 (100.0000%)
+Peak GPU memory: 30.30 GiB
+Train wall time: 3285.7 s
+
+开始提示词是："Question: {question}\nAnswer with the shortest correct answer only."
+后面加入了"The answer must be a simple short answer, usually one word, a short phrase, yes/no, or a number."
+原始模型
+no_bbox
+Answer Accuracy:
+  total   : 685/1000 = 0.6850
+  bbox    : 633/937 = 0.6756
+  no_bbox : 52/63 = 0.8254
+
+no_bbox + same_box
+Answer Accuracy:
+  total   : 668/1000 = 0.6680
+  bbox    : 616/937 = 0.6574
+  no_bbox : 52/63 = 0.8254
+
+no_bbox + color_box
+Answer Accuracy:
+  total   : 670/1000 = 0.6700
+  bbox    : 618/937 = 0.6596
+  no_bbox : 52/63 = 0.8254
+
+no_bbox + color_box_label
+Answer Accuracy:
+  total   : 796/1000 = 0.7960
+  bbox    : 744/937 = 0.7940
+  no_bbox : 52/63 = 0.8254
+
+bbox_prompt:
+Answer Accuracy:
+  total   : 799/1000 = 0.7990
+  bbox    : 747/937 = 0.7972
+  no_bbox : 52/63 = 0.8254
+
+bbox_prompt + same_box
+Answer Accuracy:
+  total   : 781/1000 = 0.7810
+  bbox    : 729/937 = 0.7780
+  no_bbox : 52/63 = 0.8254
+
+bbox_prompt + color_box
+Answer Accuracy:
+  total   : 781/1000 = 0.7810
+  bbox    : 729/937 = 0.7780
+  no_bbox : 52/63 = 0.8254
+
+bbox_prompt + color_box_label
+Answer Accuracy:
+  total   : 790/1000 = 0.7900
+  bbox    : 738/937 = 0.7876
+  no_bbox : 52/63 = 0.8254
+
+color_prompt
+Answer Accuracy:
+  total   : 798/1000 = 0.7980
+  bbox    : 746/937 = 0.7962
+  no_bbox : 52/63 = 0.8254
+
+color_prompt + same_box
+Answer Accuracy:
+  total   : 782/1000 = 0.7820
+  bbox    : 730/937 = 0.7791
+  no_bbox : 52/63 = 0.8254
+
+color_prompt + color_box
+Answer Accuracy:
+  total   : 772/1000 = 0.7720
+  bbox    : 720/937 = 0.7684
+  no_bbox : 52/63 = 0.8254
+
+color_prompt + color_box_label
+Answer Accuracy:
+  total   : 779/1000 = 0.7790
+  bbox    : 727/937 = 0.7759
+  no_bbox : 52/63 = 0.8254
+
+color_bbox_prompt
+Answer Accuracy:
+  total   : 798/1000 = 0.7980
+  bbox    : 746/937 = 0.7962
+  no_bbox : 52/63 = 0.8254
+
+color_bbox_prompt + same_box
+Answer Accuracy:
+  total   : 758/1000 = 0.7580
+  bbox    : 706/937 = 0.7535
+  no_bbox : 52/63 = 0.8254
+
+color_bbox_prompt + color_box
+Answer Accuracy:
+  total   : 756/1000 = 0.7560
+  bbox    : 704/937 = 0.7513
+  no_bbox : 52/63 = 0.8254
+
+color_bbox_prompt + color_box_label
+Answer Accuracy:
+  total   : 790/1000 = 0.7900
+  bbox    : 738/937 = 0.7876
+  no_bbox : 52/63 = 0.8254
+
+8b bbox_prompt
+Answer Accuracy:
+  total   : 842/1000 = 0.8420
+  bbox    : 790/937 = 0.8431
+  no_bbox : 52/63 = 0.8254
+和没改提示词差不多，说明8b的本来就知道回答格式
+
+8b color_bbox_prompt + color_box_label
+Answer Accuracy:
+  total   : 844/1000 = 0.8440
+  bbox    : 792/937 = 0.8453
+  no_bbox : 52/63 = 0.8254
+
+用原始模型的 bbox 推理 8000 条训练数据
+Answer Accuracy:
+  total   : 6436/8000 = 0.8045
+  bbox    : 6045/7493 = 0.8068
+  no_bbox : 391/507 = 0.7712
+筛选出 1564 条 hard cases
+
+
+bs 32 lr 5e-6 bbox 8000
+[pre-train @ optim_step=0] total=0.7990 (n=1000), bbox=0.7972 (n=937), no_bbox=0.8254 (n=63)          
+[periodic @ optim_step=10] total=0.8640 (n=1000), bbox=0.8666 (n=937), no_bbox=0.8254 (n=63)          
+[periodic @ optim_step=20] total=0.8690 (n=1000), bbox=0.8698 (n=937), no_bbox=0.8571 (n=63)          
+train[D_full]:   9%|██▏                     | 716/8000 [09:39<42:59,  2.82it/s, loss=0.3399, optim=22]
+
+bs 16 lr 1e-6 bbox 8000
+
+bs 16 lr 5e-6 bbox 8000
+[periodic @ optim_step=10] total=0.8400 (n=1000), bbox=0.8420 (n=937), no_bbox=0.8095 (n=63)          
+[periodic @ optim_step=20] total=0.8630 (n=1000), bbox=0.8645 (n=937), no_bbox=0.8413 (n=63)          
+[periodic @ optim_step=30] total=0.8740 (n=1000), bbox=0.8783 (n=937), no_bbox=0.8095 (n=63)          
+[periodic @ optim_step=40] total=0.8730 (n=1000), bbox=0.8773 (n=937), no_bbox=0.8095 (n=63)          
+[periodic @ optim_step=50] total=0.8760 (n=1000), bbox=0.8794 (n=937), no_bbox=0.8254 (n=63)          
+train[D_full]:  10%|██▎                   | 840/8000 [14:16<1:20:47,  1.48it/s, loss=0.0047, optim=52]  
+
+bs 16 lr 1e-5 bbox 8000
+[periodic @ optim_step=10] total=0.8630 (n=1000), bbox=0.8655 (n=937), no_bbox=0.8254 (n=63)          
+[periodic @ optim_step=20] total=0.8650 (n=1000), bbox=0.8677 (n=937), no_bbox=0.8254 (n=63)          
+[periodic @ optim_step=30] total=0.8670 (n=1000), bbox=0.8698 (n=937), no_bbox=0.8254 (n=63)          
+[periodic @ optim_step=40] total=0.8700 (n=1000), bbox=0.8730 (n=937), no_bbox=0.8254 (n=63)          
+[periodic @ optim_step=50] total=0.8740 (n=1000), bbox=0.8783 (n=937), no_bbox=0.8095 (n=63)          
+train[D_full]:  11%|██▌                     | 848/8000 [14:10<58:39,  2.03it/s, loss=0.1336, optim=52]
+
+bs 16 lr 5e-5 bbox 8000
+[periodic @ optim_step=10] total=0.6360 (n=1000), bbox=0.6435 (n=937), no_bbox=0.5238 (n=63)          
+[periodic @ optim_step=20] total=0.7380 (n=1000), bbox=0.7460 (n=937), no_bbox=0.6190 (n=63)          
+train[D_full]:   4%|▉                     | 352/8000 [05:46<2:12:31,  1.04s/it, loss=0.8287, optim=21]
+
+
+bs 8 lr 5e-6 bbox 8000
+[periodic @ optim_step=10] total=0.8400 (n=1000), bbox=0.8431 (n=937), no_bbox=0.7937 (n=63)          
+[periodic @ optim_step=20] total=0.8500 (n=1000), bbox=0.8527 (n=937), no_bbox=0.8095 (n=63)          
+[periodic @ optim_step=30] total=0.8610 (n=1000), bbox=0.8634 (n=937), no_bbox=0.8254 (n=63)          
+[periodic @ optim_step=40] total=0.8670 (n=1000), bbox=0.8687 (n=937), no_bbox=0.8413 (n=63)          
+[periodic @ optim_step=50] total=0.8730 (n=1000), bbox=0.8773 (n=937), no_bbox=0.8095 (n=63)          
+[periodic @ optim_step=60] total=0.8750 (n=1000), bbox=0.8794 (n=937), no_bbox=0.8095 (n=63)          
+[periodic @ optim_step=70] total=0.8720 (n=1000), bbox=0.8751 (n=937), no_bbox=0.8254 (n=63)          
+[periodic @ optim_step=80] total=0.8720 (n=1000), bbox=0.8741 (n=937), no_bbox=0.8413 (n=63)          
+[periodic @ optim_step=90] total=0.8720 (n=1000), bbox=0.8741 (n=937), no_bbox=0.8413 (n=63)          
+train[D_full]:  10%|██                    | 760/8000 [21:34<1:21:35,  1.48it/s, loss=0.0199, optim=94]

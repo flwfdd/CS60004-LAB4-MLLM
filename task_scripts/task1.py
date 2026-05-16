@@ -12,6 +12,7 @@ from types import SimpleNamespace
 
 import torch
 import torch.nn as nn
+from torch.utils.data import DataLoader, Dataset
 from PIL import Image
 from tqdm.auto import tqdm
 
@@ -62,68 +63,34 @@ def _pad_to(t: torch.Tensor, length: int, value: int) -> torch.Tensor:
     return torch.cat([t, pad], dim=0)
 
 
-def collate_micro_batch(
-    rows: list[dict],
-    tokenizer,
-    model,
-    image_root: Path,
-    *,
-    max_tiles: int,
-    prompt_mode: str,
-    max_bboxes: int,
-    device: torch.device,
-) -> tuple[torch.Tensor, ...]:
-    """把若干条样本拼成一个 micro-batch；右侧填充 input_ids / attention_mask / labels。"""
-    pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
+class TrainRowsDataset(Dataset):
+    def __init__(self, rows: list[dict]):
+        self.rows = rows
 
-    pv_list, ids_list, mask_list, lbl_list = [], [], [], []
-    for row in rows:
-        question = row.get("question")
-        answer = row.get("answer")
-        if question is None or answer is None:
-            raise KeyError("训练样本必须包含 question/answer 字段。")
+    def __len__(self) -> int:
+        return len(self.rows)
 
-        path = resolve_image(row["image"], image_root)
-        if not path.is_file():
-            raise FileNotFoundError(
-                f"找不到图像：{path}\n请检查 cfg.image_root 与 jsonl 中的相对路径。"
-            )
-        pv = internvl_dynamic_tile_pixel_values(
-            Image.open(path).convert("RGB"), max_tiles=max_tiles
-        ).to(device=device, dtype=torch.bfloat16)
-        ids, mask, lbl = tokenize_sft(
-            tokenizer,
-            model,
-            num_patches=pv.shape[0],
-            prompt=build_prompt(row, prompt_mode, max_bboxes=max_bboxes),
-            answer=str(answer),
-        )
-        pv_list.append(pv)
-        ids_list.append(ids.squeeze(0))
-        mask_list.append(mask.squeeze(0))
-        lbl_list.append(lbl.squeeze(0))
-
-    max_len = max(t.shape[0] for t in ids_list)
-    input_ids = torch.stack([_pad_to(t, max_len, pad_id) for t in ids_list]).to(device)
-    attention_mask = torch.stack([_pad_to(t, max_len, 0) for t in mask_list]).to(device)
-    labels = torch.stack([_pad_to(t, max_len, -100) for t in lbl_list]).to(device)
-    pixel_values = torch.cat(pv_list, dim=0)
-    image_flags = torch.ones(pixel_values.shape[0], dtype=torch.long, device=device)
-    return pixel_values, input_ids, attention_mask, labels, image_flags
+    def __getitem__(self, idx: int) -> dict:
+        return self.rows[idx]
 
 
 def tokenize_sft(
-    tokenizer, model, num_patches: int, prompt: str, answer: str
+    tokenizer,
+    *,
+    template_name: str,
+    system_message: str,
+    num_image_token: int,
+    num_patches: int,
+    prompt: str,
+    answer: str,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     user_msg = f"<image>\n{prompt.strip()}"
-    template = get_conv_template(model.template)
-    template.system_message = model.system_message
+    template = get_conv_template(template_name)
+    template.system_message = system_message
     template.append_message(template.roles[0], user_msg)
     template.append_message(template.roles[1], None)
     prefix = template.get_prompt()
-    img_tokens = (
-        "<img>" + "<IMG_CONTEXT>" * model.num_image_token * num_patches + "</img>"
-    )
+    img_tokens = "<img>" + "<IMG_CONTEXT>" * num_image_token * num_patches + "</img>"
     prefix = prefix.replace("<image>", img_tokens, 1)
     suffix = answer.strip() + template.sep
     full = prefix + suffix
@@ -141,6 +108,122 @@ def tokenize_sft(
     return input_ids, attention_mask, labels
 
 
+class TrainBatchCollator:
+    def __init__(
+        self,
+        tokenizer,
+        *,
+        template_name: str,
+        system_message: str,
+        num_image_token: int,
+        image_root: Path,
+        max_tiles: int,
+        prompt_mode: str,
+        max_bboxes: int,
+    ):
+        self.tokenizer = tokenizer
+        self.template_name = template_name
+        self.system_message = system_message
+        self.num_image_token = num_image_token
+        self.image_root = image_root
+        self.max_tiles = max_tiles
+        self.prompt_mode = prompt_mode
+        self.max_bboxes = max_bboxes
+
+    def __call__(self, rows: list[dict]) -> dict[str, torch.Tensor | int]:
+        """在 worker 中完成图片预处理、prompt 构造与 tokenization。"""
+        pad_id = (
+            self.tokenizer.pad_token_id
+            if self.tokenizer.pad_token_id is not None
+            else 0
+        )
+        pv_list, ids_list, mask_list, lbl_list = [], [], [], []
+
+        for row in rows:
+            question = row.get("question")
+            answer = row.get("answer")
+            if question is None or answer is None:
+                raise KeyError("训练样本必须包含 question/answer 字段。")
+
+            path = resolve_image(row["image"], self.image_root)
+            if not path.is_file():
+                raise FileNotFoundError(
+                    f"找不到图像：{path}\n请检查 cfg.image_root 与 jsonl 中的相对路径。"
+                )
+            with Image.open(path) as image:
+                pv = internvl_dynamic_tile_pixel_values(
+                    image.convert("RGB"), max_tiles=self.max_tiles
+                ).to(dtype=torch.bfloat16)
+            ids, mask, lbl = tokenize_sft(
+                self.tokenizer,
+                template_name=self.template_name,
+                system_message=self.system_message,
+                num_image_token=self.num_image_token,
+                num_patches=pv.shape[0],
+                prompt=build_prompt(row, self.prompt_mode, max_bboxes=self.max_bboxes),
+                answer=str(answer),
+            )
+            pv_list.append(pv)
+            ids_list.append(ids.squeeze(0))
+            mask_list.append(mask.squeeze(0))
+            lbl_list.append(lbl.squeeze(0))
+
+        max_len = max(t.shape[0] for t in ids_list)
+        input_ids = torch.stack([_pad_to(t, max_len, pad_id) for t in ids_list])
+        attention_mask = torch.stack([_pad_to(t, max_len, 0) for t in mask_list])
+        labels = torch.stack([_pad_to(t, max_len, -100) for t in lbl_list])
+        pixel_values = torch.cat(pv_list, dim=0)
+        image_flags = torch.ones(pixel_values.shape[0], dtype=torch.long)
+        return {
+            "pixel_values": pixel_values,
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "labels": labels,
+            "image_flags": image_flags,
+            "sample_count": len(rows),
+        }
+
+
+class EvalBatchCollator:
+    def __init__(
+        self,
+        image_root: Path,
+        *,
+        max_tiles: int,
+        prompt_mode: str,
+        max_bboxes: int,
+    ):
+        self.image_root = image_root
+        self.max_tiles = max_tiles
+        self.prompt_mode = prompt_mode
+        self.max_bboxes = max_bboxes
+
+    def __call__(self, rows: list[dict]) -> dict[str, object]:
+        pv_list, num_patches_list, questions = [], [], []
+        for row in rows:
+            path = resolve_image(row["image"], self.image_root)
+            if not path.is_file():
+                raise FileNotFoundError(
+                    f"找不到图像：{path}\n请检查 cfg.image_root 与 jsonl 中的相对路径。"
+                )
+            with Image.open(path) as image:
+                pv = internvl_dynamic_tile_pixel_values(
+                    image.convert("RGB"), max_tiles=self.max_tiles
+                ).to(dtype=torch.bfloat16)
+            pv_list.append(pv)
+            num_patches_list.append(pv.shape[0])
+            questions.append(
+                build_prompt(row, self.prompt_mode, max_bboxes=self.max_bboxes)
+            )
+        return {
+            "rows": rows,
+            "pixel_values": torch.cat(pv_list, dim=0),
+            "num_patches_list": num_patches_list,
+            "questions": questions,
+            "sample_count": len(rows),
+        }
+
+
 @torch.inference_mode()
 def val_accuracy(
     model,
@@ -155,6 +238,9 @@ def val_accuracy(
     prompt_mode: str,
     max_bboxes: int,
     batch_size: int = 1,
+    num_workers: int = 0,
+    prefetch_factor: int = 2,
+    pin_memory: bool = True,
     desc: str = "eval",
 ) -> dict:
     """返回 dict: total / bbox / no_bbox 三档准确率以及样本数。
@@ -169,30 +255,36 @@ def val_accuracy(
     subset = rows[:limit]
     gen_cfg = dict(max_new_tokens=max_new_tokens, do_sample=False)
     bs = max(int(batch_size), 1)
+    collator = EvalBatchCollator(
+        image_root,
+        max_tiles=max_tiles,
+        prompt_mode=prompt_mode,
+        max_bboxes=max_bboxes,
+    )
+    loader_kwargs = {
+        "batch_size": bs,
+        "shuffle": False,
+        "num_workers": max(int(num_workers), 0),
+        "collate_fn": collator,
+        "pin_memory": bool(pin_memory),
+    }
+    if loader_kwargs["num_workers"] > 0:
+        loader_kwargs["prefetch_factor"] = max(int(prefetch_factor), 1)
+        loader_kwargs["persistent_workers"] = True
+    loader = DataLoader(TrainRowsDataset(subset), **loader_kwargs)
 
     bar = tqdm(total=len(subset), desc=desc, leave=False, dynamic_ncols=True)
-    for start in range(0, len(subset), bs):
-        chunk = subset[start : start + bs]
-
-        pv_list, num_patches_list, questions = [], [], []
-        for row in chunk:
-            path = resolve_image(row["image"], image_root)
-            pv = internvl_dynamic_tile_pixel_values(
-                Image.open(path).convert("RGB"), max_tiles=max_tiles
-            ).to(device=device, dtype=torch.bfloat16)
-            pv_list.append(pv)
-            num_patches_list.append(pv.shape[0])
-            questions.append(build_prompt(row, prompt_mode, max_bboxes=max_bboxes))
-
-        pixel_values = torch.cat(pv_list, dim=0)
+    for batch in loader:
+        chunk = batch["rows"]
+        pixel_values = batch["pixel_values"].to(device=device, non_blocking=True)
         preds = [
             p.strip()
             for p in model.batch_chat(
                 tokenizer,
                 pixel_values,
-                questions,
+                batch["questions"],
                 gen_cfg,
-                num_patches_list=num_patches_list,
+                num_patches_list=batch["num_patches_list"],
             )
         ]
 
@@ -208,7 +300,7 @@ def val_accuracy(
                 n_no += 1
                 correct_no += int(ok)
 
-        bar.update(len(chunk))
+        bar.update(int(batch["sample_count"]))
         bar.set_postfix(acc=f"{correct_total / n_total:.3f}")
     bar.close()
     if was_training:
@@ -236,7 +328,12 @@ def train_one_config(
     *,
     log_wandb: bool = False,
 ) -> dict:
-    from transformers import AutoModel, AutoTokenizer
+    from transformers import (
+        AutoModel,
+        AutoTokenizer,
+        get_constant_schedule,
+        get_cosine_schedule_with_warmup,
+    )
 
     torch.cuda.reset_peak_memory_stats(device)
 
@@ -285,6 +382,29 @@ def train_one_config(
 
     total, trainable, ratio = count_parameters(model)
     train_rows = load_mixed_train_rows(cfg.train_jsonl, cfg.max_train_samples)
+    train_dataset = TrainRowsDataset(train_rows)
+    train_collator = TrainBatchCollator(
+        tokenizer,
+        template_name=model.template,
+        system_message=model.system_message,
+        num_image_token=model.num_image_token,
+        image_root=image_root,
+        max_tiles=cfg.max_tiles,
+        prompt_mode=cfg.prompt_mode,
+        max_bboxes=cfg.max_bboxes,
+    )
+    train_loader_kwargs = {
+        "batch_size": cfg.micro_batch_size,
+        "shuffle": False,
+        "drop_last": True,
+        "num_workers": max(int(cfg.num_workers), 0),
+        "collate_fn": train_collator,
+        "pin_memory": bool(cfg.pin_memory),
+    }
+    if train_loader_kwargs["num_workers"] > 0:
+        train_loader_kwargs["prefetch_factor"] = max(int(cfg.prefetch_factor), 1)
+        train_loader_kwargs["persistent_workers"] = True
+    train_loader = DataLoader(train_dataset, **train_loader_kwargs)
 
     opt = torch.optim.AdamW(
         (p for p in model.parameters() if p.requires_grad), lr=cfg.lr, weight_decay=0.01
@@ -318,6 +438,9 @@ def train_one_config(
             prompt_mode=cfg.prompt_mode,
             max_bboxes=cfg.max_bboxes,
             batch_size=cfg.eval_batch_size,
+            num_workers=cfg.num_workers,
+            prefetch_factor=cfg.prefetch_factor,
+            pin_memory=cfg.pin_memory,
             desc=f"eval[{tag}@{at_optim_step}]",
         )
         eval_time_total += time.perf_counter() - t_eval
@@ -347,9 +470,28 @@ def train_one_config(
             )
         return m
 
-    total_micro = cfg.epochs * (len(train_rows) // cfg.micro_batch_size)
+    train_samples_per_epoch = (
+        len(train_rows) // cfg.micro_batch_size
+    ) * cfg.micro_batch_size
+    total_train_samples = cfg.epochs * train_samples_per_epoch
+    total_micro_steps = cfg.epochs * (train_samples_per_epoch // cfg.micro_batch_size)
+    total_optim_steps = total_micro_steps // accumulation_steps
+    warmup_steps = int(total_optim_steps * float(cfg.lr_warmup_ratio))
+    schedule_name = (cfg.lr_schedule or "constant").strip().lower()
+    if schedule_name == "constant":
+        lr_scheduler = get_constant_schedule(opt)
+    elif schedule_name == "warmup_cosine":
+        lr_scheduler = get_cosine_schedule_with_warmup(
+            opt,
+            num_warmup_steps=warmup_steps,
+            num_training_steps=max(total_optim_steps, 1),
+        )
+    else:
+        raise ValueError(
+            f"未知 lr_schedule={cfg.lr_schedule!r}，仅支持 'constant' / 'warmup_cosine'"
+        )
     pbar = tqdm(
-        total=total_micro,
+        total=total_train_samples,
         desc=f"train[{cfg_name}]",
         dynamic_ncols=True,
         leave=True,
@@ -364,21 +506,15 @@ def train_one_config(
         last_val = _run_eval(0, eval_val_n, "pre-train")
 
     for _ in range(cfg.epochs):
-        for i in range(0, len(train_rows), cfg.micro_batch_size):
-            chunk = train_rows[i : i + cfg.micro_batch_size]
-            if len(chunk) < cfg.micro_batch_size:
-                break  # drop_last，保持梯度累积窗口完整
-
-            pv, input_ids, attention_mask, labels, flags = collate_micro_batch(
-                chunk,
-                tokenizer,
-                model,
-                image_root,
-                max_tiles=cfg.max_tiles,
-                prompt_mode=cfg.prompt_mode,
-                max_bboxes=cfg.max_bboxes,
-                device=device,
+        for batch in train_loader:
+            pv = batch["pixel_values"].to(device=device, non_blocking=True)
+            input_ids = batch["input_ids"].to(device=device, non_blocking=True)
+            attention_mask = batch["attention_mask"].to(
+                device=device, non_blocking=True
             )
+            labels = batch["labels"].to(device=device, non_blocking=True)
+            flags = batch["image_flags"].to(device=device, non_blocking=True)
+            sample_count = int(batch["sample_count"])
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 out = model(
                     pixel_values=pv,
@@ -392,10 +528,11 @@ def train_one_config(
             loss.backward()
             last_loss = loss.detach().float().item() * accumulation_steps
             micro_step += 1
-            pbar.update(1)
+            pbar.update(sample_count)
             pbar.set_postfix(
                 loss=f"{last_loss:.4f}",
                 optim=optim_step,
+                lr=f"{opt.param_groups[0]['lr']:.2e}",
             )
 
             if micro_step % accumulation_steps == 0:
@@ -403,6 +540,8 @@ def train_one_config(
                     [p for p in model.parameters() if p.requires_grad], 1.0
                 )
                 opt.step()
+                if lr_scheduler is not None:
+                    lr_scheduler.step()
                 opt.zero_grad(set_to_none=True)
                 optim_step += 1
                 if log_wandb:
@@ -412,6 +551,7 @@ def train_one_config(
                         {
                             "train/loss": last_loss,
                             "train/micro_step": micro_step,
+                            "train/lr": opt.param_groups[0]["lr"],
                         },
                         step=optim_step,
                     )
@@ -436,6 +576,9 @@ def train_one_config(
         prompt_mode=cfg.prompt_mode,
         max_bboxes=cfg.max_bboxes,
         batch_size=cfg.eval_batch_size,
+        num_workers=cfg.num_workers,
+        prefetch_factor=cfg.prefetch_factor,
+        pin_memory=cfg.pin_memory,
         desc="eval[final]",
     )
 
@@ -444,6 +587,7 @@ def train_one_config(
     model.save_pretrained(out_dir)
     tokenizer.save_pretrained(out_dir)
 
+    final_lr = opt.param_groups[0]["lr"]
     del model, tokenizer, opt
     torch.cuda.empty_cache()
 
@@ -467,6 +611,9 @@ def train_one_config(
         "max_bboxes": cfg.max_bboxes,
         "optim_steps": optim_step,
         "micro_steps": micro_step,
+        "lr_schedule": cfg.lr_schedule,
+        "lr_warmup_ratio": cfg.lr_warmup_ratio,
+        "final_lr": final_lr,
     }
     if log_wandb:
         import wandb
@@ -481,6 +628,7 @@ def train_one_config(
                 "val/samples_no_bbox": final_metrics["n_no_bbox"],
                 "model/trainable_params": trainable,
                 "model/trainable_ratio_pct": ratio,
+                "train/lr": final_lr,
                 "sys/peak_gpu_memory_gb": peak_mem_gb,
                 "train/wall_time_sec": train_time,
                 "train/optim_steps": optim_step,
@@ -533,8 +681,8 @@ def main() -> None:
     #    image_root  = ROOT
     #    prompt_mode = "color_bbox_prompt"
     cfg = SimpleNamespace(
-        # model_path=str(ROOT / "data/models/InternVL2-2B"),
-        model_path=str(ROOT / "outputs/task1/D_full"),
+        model_path=str(ROOT / "data/models/InternVL2-2B"),
+        # model_path=str(ROOT / "outputs/task1/D_full"),
         train_jsonl=[
             # str(ROOT / "data/mm_lab/data/task1/train.jsonl"),
             # str(ROOT / "outputs/task1/hard_train.jsonl"),
@@ -546,27 +694,32 @@ def main() -> None:
         ],
         val_jsonl=str(ROOT / "data/mm_lab/data/val.jsonl"),
         # val_jsonl=str(ROOT / "outputs/task1/hard_val.jsonl"),
-        output_dir=str(ROOT / "outputs/task1"),
+        output_dir=str(ROOT / "outputs/task3"),
         image_root=str(ROOT / "data/mm_lab"),
         freeze_config="D_full",
         epochs=1,
-        lr=2e-5,
-        batch_size=64,
-        micro_batch_size=1,
+        lr=1e-5,
+        batch_size=16,
+        micro_batch_size=4,
         max_train_samples=0,
         val_limit=0,  # 训练结束后最终评测条数，0全量
-        eval_interval=10,  # 每多少次optim_step阶段性评测，0关闭
-        eval_val_limit=100,  # 阶段性评测样本数
-        eval_batch_size=4,  # eval 并行样本数
-        eval_at_start=True,
+        eval_interval=50,  # 每多少次optim_step阶段性评测，0关闭
+        eval_val_limit=0,  # 阶段性评测样本数
+        eval_batch_size=8,  # eval 并行样本数
+        eval_at_start=False,
+        num_workers=4,
+        prefetch_factor=2,
+        pin_memory=True,
+        lr_schedule="warmup_cosine",  # constant, warmup_cosine
+        lr_warmup_ratio=0.05,
         gradient_checkpointing=True,
-        max_new_tokens=64,
+        max_new_tokens=8,
         max_tiles=6,
         prompt_mode="bbox_prompt",  # no_bbox, bbox_prompt, color_bbox_prompt
         max_bboxes=12,
         use_wandb=True,
         wandb_project="cs60004-lab4-mllm",
-        wandb_run_prefix="task3-hard",
+        wandb_run_prefix="task3",
     )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -601,6 +754,11 @@ def main() -> None:
                 "eval_val_limit": cfg.eval_val_limit,
                 "eval_batch_size": cfg.eval_batch_size,
                 "eval_at_start": cfg.eval_at_start,
+                "num_workers": cfg.num_workers,
+                "prefetch_factor": cfg.prefetch_factor,
+                "pin_memory": cfg.pin_memory,
+                "lr_schedule": cfg.lr_schedule,
+                "lr_warmup_ratio": cfg.lr_warmup_ratio,
                 "gradient_checkpointing": cfg.gradient_checkpointing,
                 "max_new_tokens": cfg.max_new_tokens,
                 "max_tiles": cfg.max_tiles,
@@ -612,26 +770,28 @@ def main() -> None:
                 "image_root": cfg.image_root,
             },
         )
+    summ: dict | None = None
     try:
         summ = train_one_config(
             name, train_cfg, cfg, device, image_root, log_wandb=cfg.use_wandb
         )
     finally:
-        print(
-            f"Answer Accuracy (val):\n"
-            f"  total   = {summ['answer_accuracy']:.4f} (n={summ['val_samples']})\n"
-            f"  bbox    = {summ['answer_accuracy_bbox']:.4f} (n={summ['val_samples_bbox']})\n"
-            f"  no_bbox = {summ['answer_accuracy_no_bbox']:.4f} (n={summ['val_samples_no_bbox']})\n"
-            f"Trainable: {summ['trainable_params']:,} / {summ['total_params']:,} "
-            f"({summ['trainable_ratio_pct']:.4f}%)\n"
-            f"Peak GPU memory: {summ['peak_gpu_memory_gb']:.2f} GiB\n"
-            f"Train wall time: {summ['train_time_sec']:.1f} s\n"
-            f"Saved: {summ['checkpoint']}"
-        )
-        Path(cfg.output_dir).mkdir(parents=True, exist_ok=True)
-        metrics_path = Path(cfg.output_dir) / "task1_metrics.json"
-        metrics_path.write_text(json.dumps([summ], indent=2), encoding="utf-8")
-        print(f"\nWrote {metrics_path}")
+        if summ is not None:
+            print(
+                f"Answer Accuracy (val):\n"
+                f"  total   = {summ['answer_accuracy']:.4f} (n={summ['val_samples']})\n"
+                f"  bbox    = {summ['answer_accuracy_bbox']:.4f} (n={summ['val_samples_bbox']})\n"
+                f"  no_bbox = {summ['answer_accuracy_no_bbox']:.4f} (n={summ['val_samples_no_bbox']})\n"
+                f"Trainable: {summ['trainable_params']:,} / {summ['total_params']:,} "
+                f"({summ['trainable_ratio_pct']:.4f}%)\n"
+                f"Peak GPU memory: {summ['peak_gpu_memory_gb']:.2f} GiB\n"
+                f"Train wall time: {summ['train_time_sec']:.1f} s\n"
+                f"Saved: {summ['checkpoint']}"
+            )
+            Path(cfg.output_dir).mkdir(parents=True, exist_ok=True)
+            metrics_path = Path(cfg.output_dir) / "task1_metrics.json"
+            metrics_path.write_text(json.dumps([summ], indent=2), encoding="utf-8")
+            print(f"\nWrote {metrics_path}")
         if cfg.use_wandb:
             import wandb
 
