@@ -33,8 +33,16 @@ class InternLM2ForCausalLM(InternLM2PreTrainedModel, GenerationMixin):
 这样 language_model.generate(...) 在 InternVL 里可以继续用。
 
 
-val_2b_no_bbox: Answer Accuracy: 286/1000 = 0.286
-val_8b_no_bbox: Answer Accuracy: 682/1000 = 0.682
+val_2b_no_bbox: Answer Accuracy:
+Answer Accuracy:
+  total   : 247/1000 = 0.2470
+  bbox    : 233/937 = 0.2487
+  no_bbox : 14/63 = 0.2222
+val_8b_no_bbox: Answer Accuracy:
+Answer Accuracy:
+  total   : 685/1000 = 0.6850
+  bbox    : 635/937 = 0.6777
+  no_bbox : 50/63 = 0.7937
 val_2b_bbox_prompt: Answer Accuracy: 148/1000 = 0.148
 val_8b_bbox_prompt: Answer Accuracy: 845/1000 = 0.845
 
@@ -145,7 +153,7 @@ Trainable: 2,205,754,368 / 2,205,754,368 (100.0000%)
 Peak GPU memory: 21.65 GiB
 Train wall time: 589.5 s
 
-![](images/task1.png)
+![](images/task1_wandb.png)
 
 都是很快收敛，可能都是格式带来的收益。查看未微调的也确实有：
 {"id": "02853535", "prediction": "The animal on the hill is black.", "answer": "black", "correct": false, "has_bbox": true}
@@ -203,6 +211,16 @@ Answer Accuracy (val):
 Trainable: 12,595,200 / 2,205,754,368 (0.5710%)
 Peak GPU memory: 18.38 GiB
 Train wall time: 141.9 s
+
+开启Flash Attention：
+train[D_full]: 100%|██████| 512/512 [03:06<00:00,  2.75it/s, loss=0.0010, lr=5.00e-06, optim=31]
+Answer Accuracy (val):                                                                          
+  total   = 0.7000 (n=1000)
+  bbox    = 0.6905 (n=937)
+  no_bbox = 0.8413 (n=63)
+Trainable: 2,205,754,368 / 2,205,754,368 (100.0000%)
+Peak GPU memory: 21.61 GiB
+Train wall time: 186.1 s
 
 
 ## Task 2
@@ -613,6 +631,12 @@ color_bbox_prompt + color_box_label
 Answer Accuracy:
   total   : 790/1000 = 0.7900
   bbox    : 738/937 = 0.7876
+  no_bbox : 52/63 = 0.8254
+
+8b no_bbox
+Answer Accuracy:
+  total   : 679/1000 = 0.6790
+  bbox    : 627/937 = 0.6692
   no_bbox : 52/63 = 0.8254
 
 8b bbox_prompt
