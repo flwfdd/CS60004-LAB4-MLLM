@@ -4,6 +4,7 @@ Task 1：InternVL2-2B 在 GQA VQA 上按一种冻结策略做监督微调
 
 from __future__ import annotations
 
+import argparse
 import json
 import sys
 import time
@@ -422,39 +423,6 @@ def train_one_config(
     )
 
     eval_time_total = 0.0
-    best_eval: dict | None = None
-
-    def _save_checkpoint(save_dir: Path) -> None:
-        save_dir.mkdir(parents=True, exist_ok=True)
-        model.save_pretrained(save_dir)
-        tokenizer.save_pretrained(save_dir)
-
-    def _maybe_save_best(metrics: dict, at_optim_step: int, tag: str) -> None:
-        nonlocal best_eval
-        score = float(metrics["accuracy"])
-        if best_eval is not None and score <= best_eval["accuracy"]:
-            return
-        best_dir = Path(cfg.output_dir) / f"{cfg_name}_best"
-        _save_checkpoint(best_dir)
-        best_eval = {
-            "accuracy": score,
-            "accuracy_bbox": float(metrics["accuracy_bbox"]),
-            "accuracy_no_bbox": float(metrics["accuracy_no_bbox"]),
-            "n_total": int(metrics["n_total"]),
-            "n_bbox": int(metrics["n_bbox"]),
-            "n_no_bbox": int(metrics["n_no_bbox"]),
-            "optim_step": int(at_optim_step),
-            "tag": tag,
-            "checkpoint": str(best_dir),
-        }
-        msg = (
-            f"[best ckpt] saved @ {tag}/{at_optim_step}: "
-            f"total={score:.4f}, path={best_dir}"
-        )
-        if pbar is not None:
-            pbar.write(msg)
-        else:
-            print(msg)
 
     def _run_eval(at_optim_step: int, n_samples: int, tag: str) -> dict:
         nonlocal eval_time_total
@@ -501,7 +469,6 @@ def train_one_config(
                 },
                 step=max(at_optim_step, 1),
             )
-        _maybe_save_best(m, at_optim_step, tag)
         return m
 
     train_samples_per_epoch = (
@@ -617,9 +584,9 @@ def train_one_config(
     )
 
     out_dir = Path(cfg.output_dir) / cfg_name
-    _save_checkpoint(out_dir)
-    if best_eval is None:
-        _maybe_save_best(final_metrics, optim_step, "final")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    model.save_pretrained(out_dir)
+    tokenizer.save_pretrained(out_dir)
 
     final_lr = opt.param_groups[0]["lr"]
     del model, tokenizer, opt
@@ -648,17 +615,6 @@ def train_one_config(
         "lr_schedule": cfg.lr_schedule,
         "lr_warmup_ratio": cfg.lr_warmup_ratio,
         "final_lr": final_lr,
-        "best_checkpoint": None if best_eval is None else best_eval["checkpoint"],
-        "best_val_accuracy": None if best_eval is None else best_eval["accuracy"],
-        "best_val_accuracy_bbox": (
-            None if best_eval is None else best_eval["accuracy_bbox"]
-        ),
-        "best_val_accuracy_no_bbox": (
-            None if best_eval is None else best_eval["accuracy_no_bbox"]
-        ),
-        "best_val_samples": None if best_eval is None else best_eval["n_total"],
-        "best_at_optim_step": None if best_eval is None else best_eval["optim_step"],
-        "best_eval_tag": None if best_eval is None else best_eval["tag"],
     }
     if log_wandb:
         import wandb
@@ -698,92 +654,96 @@ FREEZE_CONFIGS = {
 }
 
 
-def main() -> None:
-    # Task3 visual experiment configs:
-    # 1) same_box:
-    #    train_jsonl = outputs/task3/visual_data/same_box/train.jsonl
-    #    val_jsonl   = outputs/task3/visual_data/same_box/val.jsonl
-    #    image_root  = ROOT
-    #    prompt_mode = "no_bbox"
-    # 2) color_box:
-    #    train_jsonl = outputs/task3/visual_data/color_box/train.jsonl
-    #    val_jsonl   = outputs/task3/visual_data/color_box/val.jsonl
-    #    image_root  = ROOT
-    #    prompt_mode = "no_bbox"
-    # 3) color_box_label:
-    #    train_jsonl = outputs/task3/visual_data/color_box_label/train.jsonl
-    #    val_jsonl   = outputs/task3/visual_data/color_box_label/val.jsonl
-    #    image_root  = ROOT
-    #    prompt_mode = "no_bbox"
-    # 4) same_box_bbox_prompt:
-    #    train_jsonl = outputs/task3/visual_data/same_box/train.jsonl
-    #    val_jsonl   = outputs/task3/visual_data/same_box/val.jsonl
-    #    image_root  = ROOT
-    #    prompt_mode = "bbox_prompt"
-    # 5) color_box_color_prompt:
-    #    train_jsonl = outputs/task3/visual_data/color_box/train.jsonl
-    #    val_jsonl   = outputs/task3/visual_data/color_box/val.jsonl
-    #    image_root  = ROOT
-    #    prompt_mode = "color_bbox_prompt"
-    cfg = SimpleNamespace(
-        # model_path=str(ROOT / "data/models/InternVL2-2B"),
-        model_path=str(
-            ROOT
-            / "outputs/task3/D_full"
-            # / "outputs/agent_runs/baseline_bbox_20260517_023836/baseline_bbox_20260517_023836"
-        ),
-        train_jsonl=[
-            # str(ROOT / "data/mm_lab/data/task1/train.jsonl"),
-            # str(ROOT / "outputs/task3/hard_train.jsonl"),
-            # str(ROOT / "outputs/task1/hard_train.jsonl"),
-            # str(ROOT / "outputs/task2/task2_A_text_teacher.jsonl"),
-            # str(ROOT / "outputs/task2/task2_B_vision_teacher.jsonl"),
-            # str(ROOT / "data/mm_lab/data/val.jsonl"),
-            # str(ROOT / "data/mm_lab/data/task3/train_with_bbox.jsonl"),
-            # str(ROOT / "outputs/task3/hard_train.jsonl"),
-            # str(ROOT / "outputs/task2/task2_vqa_teacher_both_1000.jsonl")
-            str(ROOT / "data/mm_lab/data/task3/train_with_bbox_shuffle.jsonl"),
-        ],
+def default_cfg() -> SimpleNamespace:
+    return SimpleNamespace(
+        model_path=str(ROOT / "data/models/InternVL2-2B"),
+        train_jsonl=[str(ROOT / "data/mm_lab/data/task3/train_with_bbox.jsonl")],
         val_jsonl=str(ROOT / "data/mm_lab/data/val.jsonl"),
-        # val_jsonl=str(ROOT / "outputs/task1/hard_val.jsonl"),
         output_dir=str(ROOT / "outputs/task3"),
         image_root=str(ROOT / "data/mm_lab"),
         freeze_config="D_full",
+        config_name="D_full",
         epochs=1,
-        lr=5e-6,
-        batch_size=32,
+        lr=1e-5,
+        batch_size=16,
         micro_batch_size=4,
         max_train_samples=0,
-        val_limit=0,  # 训练结束后最终评测条数，0全量
-        eval_interval=10,  # 每多少次optim_step阶段性评测，0关闭
-        eval_val_limit=0,  # 阶段性评测样本数
-        eval_batch_size=8,  # eval 并行样本数
+        val_limit=0,
+        eval_interval=50,
+        eval_val_limit=0,
+        eval_batch_size=8,
         eval_at_start=False,
         num_workers=4,
         prefetch_factor=2,
         pin_memory=True,
-        lr_schedule="warmup_cosine",  # constant, warmup_cosine
+        lr_schedule="warmup_cosine",
         lr_warmup_ratio=0.05,
         gradient_checkpointing=True,
         max_new_tokens=8,
         max_tiles=6,
-        prompt_mode="bbox_prompt",  # no_bbox, bbox_prompt, color_bbox_prompt
+        prompt_mode="bbox_prompt",
         max_bboxes=12,
         use_wandb=True,
         wandb_project="cs60004-lab4-mllm",
-        wandb_run_prefix="task3-baseonhard13-epoch2",
+        wandb_run_prefix="task3",
+        metrics_name="task1_metrics.json",
     )
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    defaults = default_cfg()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model-path", default=defaults.model_path)
+    parser.add_argument("--train-jsonl", nargs="+", default=list(defaults.train_jsonl))
+    parser.add_argument("--val-jsonl", default=defaults.val_jsonl)
+    parser.add_argument("--output-dir", default=defaults.output_dir)
+    parser.add_argument("--image-root", default=defaults.image_root)
+    parser.add_argument("--freeze-config", choices=list(FREEZE_CONFIGS), default=defaults.freeze_config)
+    parser.add_argument("--config-name", default=defaults.config_name)
+    parser.add_argument("--epochs", type=int, default=defaults.epochs)
+    parser.add_argument("--lr", type=float, default=defaults.lr)
+    parser.add_argument("--batch-size", type=int, default=defaults.batch_size)
+    parser.add_argument("--micro-batch-size", type=int, default=defaults.micro_batch_size)
+    parser.add_argument("--max-train-samples", type=int, default=defaults.max_train_samples)
+    parser.add_argument("--val-limit", type=int, default=defaults.val_limit)
+    parser.add_argument("--eval-interval", type=int, default=defaults.eval_interval)
+    parser.add_argument("--eval-val-limit", type=int, default=defaults.eval_val_limit)
+    parser.add_argument("--eval-batch-size", type=int, default=defaults.eval_batch_size)
+    parser.add_argument("--eval-at-start", action=argparse.BooleanOptionalAction, default=defaults.eval_at_start)
+    parser.add_argument("--num-workers", type=int, default=defaults.num_workers)
+    parser.add_argument("--prefetch-factor", type=int, default=defaults.prefetch_factor)
+    parser.add_argument("--pin-memory", action=argparse.BooleanOptionalAction, default=defaults.pin_memory)
+    parser.add_argument("--lr-schedule", choices=["constant", "warmup_cosine"], default=defaults.lr_schedule)
+    parser.add_argument("--lr-warmup-ratio", type=float, default=defaults.lr_warmup_ratio)
+    parser.add_argument("--gradient-checkpointing", action=argparse.BooleanOptionalAction, default=defaults.gradient_checkpointing)
+    parser.add_argument("--max-new-tokens", type=int, default=defaults.max_new_tokens)
+    parser.add_argument("--max-tiles", type=int, default=defaults.max_tiles)
+    parser.add_argument("--prompt-mode", choices=["no_bbox", "bbox_prompt", "color_prompt", "color_bbox_prompt", "cot"], default=defaults.prompt_mode)
+    parser.add_argument("--max-bboxes", type=int, default=defaults.max_bboxes)
+    parser.add_argument("--use-wandb", action=argparse.BooleanOptionalAction, default=defaults.use_wandb)
+    parser.add_argument("--wandb-project", default=defaults.wandb_project)
+    parser.add_argument("--wandb-run-prefix", default=defaults.wandb_run_prefix)
+    parser.add_argument("--metrics-name", default=defaults.metrics_name)
+    return parser
+
+
+def parse_args() -> SimpleNamespace:
+    return SimpleNamespace(**vars(build_arg_parser().parse_args()))
+
+
+def main() -> None:
+    cfg = parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if device.type != "cuda":
         raise RuntimeError("no cuda")
 
-    name = cfg.freeze_config
-    if name not in FREEZE_CONFIGS:
+    if cfg.freeze_config not in FREEZE_CONFIGS:
         raise ValueError(
-            f"未知 freeze_config={name!r}，请填 {list(FREEZE_CONFIGS)!r} 之一。"
+            f"未知 freeze_config={cfg.freeze_config!r}，请填 {list(FREEZE_CONFIGS)!r} 之一。"
         )
-    train_cfg = FREEZE_CONFIGS[name]
+    name = (cfg.config_name or cfg.freeze_config).strip() or cfg.freeze_config
+    train_cfg = FREEZE_CONFIGS[cfg.freeze_config]
     image_root = Path(cfg.image_root).resolve()
 
     if cfg.use_wandb:
@@ -794,7 +754,8 @@ def main() -> None:
             project=cfg.wandb_project,
             name=f"{prefix}_{name}",
             config={
-                "freeze_config": name,
+                "freeze_config": cfg.freeze_config,
+                "config_name": name,
                 **train_cfg,
                 "epochs": cfg.epochs,
                 "lr": cfg.lr,
@@ -820,6 +781,7 @@ def main() -> None:
                 "train_jsonl": list(cfg.train_jsonl),
                 "val_jsonl": cfg.val_jsonl,
                 "image_root": cfg.image_root,
+                "output_dir": cfg.output_dir,
             },
         )
     summ: dict | None = None
@@ -840,8 +802,9 @@ def main() -> None:
                 f"Train wall time: {summ['train_time_sec']:.1f} s\n"
                 f"Saved: {summ['checkpoint']}"
             )
-            Path(cfg.output_dir).mkdir(parents=True, exist_ok=True)
-            metrics_path = Path(cfg.output_dir) / "task1_metrics.json"
+            output_dir = Path(cfg.output_dir)
+            output_dir.mkdir(parents=True, exist_ok=True)
+            metrics_path = output_dir / cfg.metrics_name
             metrics_path.write_text(json.dumps([summ], indent=2), encoding="utf-8")
             print(f"\nWrote {metrics_path}")
         if cfg.use_wandb:

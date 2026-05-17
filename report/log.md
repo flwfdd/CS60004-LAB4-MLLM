@@ -166,6 +166,45 @@ Train wall time: 293.5 s
 用类似的方法构造 hard val 322 条。
 
 
+在5090上用新prompt重新跑：
+bs 16 lr 5e-6 512 samples
+D_full:
+Answer Accuracy (val):                                                    
+  total   = 0.7070 (n=1000)
+  bbox    = 0.6980 (n=937)
+  no_bbox = 0.8413 (n=63)
+Trainable: 2,205,754,368 / 2,205,754,368 (100.0000%)
+Peak GPU memory: 21.66 GiB
+Train wall time: 282.0 s
+
+C_vision_connector:
+Answer Accuracy (val):                                                    
+  total   = 0.6880 (n=1000)
+  bbox    = 0.6798 (n=937)
+  no_bbox = 0.8095 (n=63)
+Trainable: 316,607,488 / 2,205,754,368 (14.3537%)
+Peak GPU memory: 20.41 GiB
+Train wall time: 229.5 s
+
+B_
+Answer Accuracy (val):                                                    
+  total   = 0.7010 (n=1000)
+  bbox    = 0.6926 (n=937)
+  no_bbox = 0.8254 (n=63)
+Trainable: 1,901,742,080 / 2,205,754,368 (86.2173%)
+Peak GPU memory: 19.39 GiB
+Train wall time: 176.4 s
+
+A_
+Answer Accuracy (val):                                                    
+  total   = 0.6840 (n=1000)
+  bbox    = 0.6756 (n=937)
+  no_bbox = 0.8095 (n=63)
+Trainable: 12,595,200 / 2,205,754,368 (0.5710%)
+Peak GPU memory: 18.38 GiB
+Train wall time: 141.9 s
+
+
 ## Task 2
 
 bs 16 256张图片每张图片 8 条样本
@@ -227,6 +266,43 @@ Answer Accuracy (val):
 Trainable: 2,205,754,368 / 2,205,754,368 (100.0000%)
 Peak GPU memory: 21.66 GiB
 Train wall time: 593.3 s
+
+重跑：
+bs 16 lr 5e-6 samples 1024
+- baseline_1024
+  - total: 0.7040
+  - bbox: 0.6926
+  - no_bbox: 0.8730
+
+- A_only_1024
+  - total: 0.6910
+  - bbox: 0.6830
+  - no_bbox: 0.8095
+
+- B_only_1024
+  - total: 0.6870
+  - bbox: 0.6788
+  - no_bbox: 0.8095
+
+- AB_1024
+  - total: 0.6910
+  - bbox: 0.6830
+  - no_bbox: 0.8095
+
+- 1A_1024
+  - total: 0.6970
+  - bbox: 0.6884
+  - no_bbox: 0.8254
+
+- 1B_1024
+  - total: 0.6990
+  - bbox: 0.6905
+  - no_bbox: 0.8254
+
+- 1AB_1024
+  - total: 0.6950
+  - bbox: 0.6862
+  - no_bbox: 0.8254
 
 ## Task 3
 
@@ -601,3 +677,134 @@ bs 8 lr 5e-6 bbox 8000
 [periodic @ optim_step=80] total=0.8720 (n=1000), bbox=0.8741 (n=937), no_bbox=0.8413 (n=63)          
 [periodic @ optim_step=90] total=0.8720 (n=1000), bbox=0.8741 (n=937), no_bbox=0.8413 (n=63)          
 train[D_full]:  10%|██                    | 760/8000 [21:34<1:21:35,  1.48it/s, loss=0.0199, optim=94]
+
+
+
+task2-vqa-text: 100%|███████████| 1000/1000 [06:11<00:00,  2.69it/s, last=16, rows=1956]
+mode=text rows=1956 | attribute=278, color=90, counting=193, location=41, object=606, spatial=205, yes_no=543
+task2-vqa-vision: 100%|█████████| 1000/1000 [07:56<00:00,  2.10it/s, last=15, rows=1927]
+mode=vision rows=1927 | attribute=278, color=90, counting=193, location=43, object=604, spatial=176, yes_no=543
+saved 3539 rows -> outputs/task2/task2_vqa_teacher_both_1000.jsonl
+rows=3539 | attribute=523, color=163, counting=364, location=81, object=1100, spatial=362, yes_no=946
+
+
+
+pred=8000, kept=2399 -> /mnt/bn/codeai-lq/mlx/users/fanliwen.2333/playground/code/CS60004-LAB4-MLLM/outputs/task1/hard_train.jsonl
+wrong case distribution:
+  no_bbox | color           : 110
+  no_bbox | location        : 63
+  no_bbox | object_attribute: 611
+  no_bbox | other           : 592
+  no_bbox | spatial         : 477
+  no_bbox | yes_no          : 546
+kept case distribution:
+  no_bbox | color           : 110
+  no_bbox | location        : 63
+  no_bbox | object_attribute: 611
+  no_bbox | other           : 592
+  no_bbox | spatial         : 477
+  no_bbox | yes_no          : 546
+
+混合 task1/3 hard
+[periodic @ optim_step=20] total=0.8910 (n=1000), bbox=0.8933 (n=937), no_bbox=0.8571 (n
+=63)
+[best ckpt] saved @ periodic/20: total=0.8910, path=/mnt/bn/codeai-lq/mlx/users/fanliwen
+.2333/playground/code/CS60004-LAB4-MLLM/outputs/task3/D_full_best
+[periodic @ optim_step=40] total=0.8940 (n=1000), bbox=0.8954 (n=937), no_bbox=0.8730 (n
+=63)
+[best ckpt] saved @ periodic/40: total=0.8940, path=/mnt/bn/codeai-lq/mlx/users/fanliwen
+.2333/playground/code/CS60004-LAB4-MLLM/outputs/task3/D_full_best
+[periodic @ optim_step=60] total=0.8920 (n=1000), bbox=0.8933 (n=937), no_bbox=0.8730 (n
+=63)
+[periodic @ optim_step=80] total=0.8950 (n=1000), bbox=0.8965 (n=937), no_bbox=0.8730 (n
+=63)
+[best ckpt] saved @ periodic/80: total=0.8950, path=/mnt/bn/codeai-lq/mlx/users/fanliwen
+.2333/playground/code/CS60004-LAB4-MLLM/outputs/task3/D_full_best
+[periodic @ optim_step=100] total=0.8930 (n=1000), bbox=0.8943 (n=937), no_bbox=0.8730 (
+n=63)
+[periodic @ optim_step=120] total=0.8970 (n=1000), bbox=0.8986 (n=937), no_bbox=0.8730 (
+n=63)
+[best ckpt] saved @ periodic/120: total=0.8970, path=/mnt/bn/codeai-lq/mlx/users/fanliwe
+n.2333/playground/code/CS60004-LAB4-MLLM/outputs/task3/D_full_best
+[periodic @ optim_step=140] total=0.8920 (n=1000), bbox=0.8933 (n=937), no_bbox=0.8730 (
+n=63)
+[periodic @ optim_step=160] total=0.8940 (n=1000), bbox=0.8954 (n=937), no_bbox=0.8730 (
+n=63)
+[periodic @ optim_step=180] total=0.8940 (n=1000), bbox=0.8954 (n=937), no_bbox=0.8730 (
+n=63)
+train[D_full]: 100%|█| 3128/3128 [34:57<00:00,  1.49it/s, loss=0.3452, lr=0.00e+00, opti
+Answer Accuracy (val):
+  total   = 0.8940 (n=1000)
+  bbox    = 0.8954 (n=937)
+  no_bbox = 0.8730 (n=63)
+Trainable: 2,205,754,368 / 2,205,754,368 (100.0000%)
+Peak GPU memory: 30.26 GiB
+Train wall time: 1088.0 s
+
+
+
+[periodic @ optim_step=10] total=0.8960 (n=1000), bbox=0.8975 (n=937), no_bbox=0.8730 (n
+=63)
+[best ckpt] saved @ periodic/10: total=0.8960, path=/mnt/bn/codeai-lq/mlx/users/fanliwen
+.2333/playground/code/CS60004-LAB4-MLLM/outputs/task3/D_full_best
+[periodic @ optim_step=20] total=0.8980 (n=1000), bbox=0.8997 (n=937), no_bbox=0.8730 (n
+=63)
+[best ckpt] saved @ periodic/20: total=0.8980, path=/mnt/bn/codeai-lq/mlx/users/fanliwen
+.2333/playground/code/CS60004-LAB4-MLLM/outputs/task3/D_full_best
+[periodic @ optim_step=30] total=0.8980 (n=1000), bbox=0.9018 (n=937), no_bbox=0.8413 (n
+=63)
+[periodic @ optim_step=40] total=0.8980 (n=1000), bbox=0.9007 (n=937), no_bbox=0.8571 (n
+=63)
+[periodic @ optim_step=50] total=0.9010 (n=1000), bbox=0.9039 (n=937), no_bbox=0.8571 (n
+=63)
+[best ckpt] saved @ periodic/50: total=0.9010, path=/mnt/bn/codeai-lq/mlx/users/fanliwen
+.2333/playground/code/CS60004-LAB4-MLLM/outputs/task3/D_full_best
+[periodic @ optim_step=60] total=0.9000 (n=1000), bbox=0.9029 (n=937), no_bbox=0.8571 (n
+=63)
+[periodic @ optim_step=70] total=0.8980 (n=1000), bbox=0.9018 (n=937), no_bbox=0.8413 (n
+=63)
+[periodic @ optim_step=80] total=0.8980 (n=1000), bbox=0.9018 (n=937), no_bbox=0.8413 (n
+=63)
+[periodic @ optim_step=90] total=0.8970 (n=1000), bbox=0.9007 (n=937), no_bbox=0.8413 (n
+=63)
+[periodic @ optim_step=100] total=0.9060 (n=1000), bbox=0.9082 (n=937), no_bbox=0.8730 (
+n=63)
+[best ckpt] saved @ periodic/100: total=0.9060, path=/mnt/bn/codeai-lq/mlx/users/fanliwe
+n.2333/playground/code/CS60004-LAB4-MLLM/outputs/task3/D_full_best
+[periodic @ optim_step=110] total=0.9040 (n=1000), bbox=0.9072 (n=937), no_bbox=0.8571 (
+n=63)
+[periodic @ optim_step=120] total=0.8990 (n=1000), bbox=0.9018 (n=937), no_bbox=0.8571 (
+n=63)
+[periodic @ optim_step=130] total=0.8990 (n=1000), bbox=0.9007 (n=937), no_bbox=0.8730 (
+n=63)
+[periodic @ optim_step=140] total=0.9030 (n=1000), bbox=0.9050 (n=937), no_bbox=0.8730 (
+n=63)
+[periodic @ optim_step=150] total=0.9030 (n=1000), bbox=0.9050 (n=937), no_bbox=0.8730 (
+n=63)
+[periodic @ optim_step=160] total=0.9010 (n=1000), bbox=0.9029 (n=937), no_bbox=0.8730 (
+n=63)
+[periodic @ optim_step=170] total=0.9040 (n=1000), bbox=0.9061 (n=937), no_bbox=0.8730 (
+n=63)
+[periodic @ optim_step=180] total=0.9020 (n=1000), bbox=0.9050 (n=937), no_bbox=0.8571 (
+n=63)
+[periodic @ optim_step=190] total=0.9020 (n=1000), bbox=0.9050 (n=937), no_bbox=0.8571 (
+n=63)
+[periodic @ optim_step=200] total=0.9000 (n=1000), bbox=0.9029 (n=937), no_bbox=0.8571 (
+n=63)
+[periodic @ optim_step=210] total=0.9050 (n=1000), bbox=0.9082 (n=937), no_bbox=0.8571 (
+n=63)
+[periodic @ optim_step=220] total=0.9020 (n=1000), bbox=0.9050 (n=937), no_bbox=0.8571 (
+n=63)
+[periodic @ optim_step=230] total=0.9030 (n=1000), bbox=0.9061 (n=937), no_bbox=0.8571 (n=63)
+[periodic @ optim_step=240] total=0.9020 (n=1000), bbox=0.9050 (n=937), no_bbox=0.8571 (n=63)
+[periodic @ optim_step=250] total=0.9000 (n=1000), bbox=0.9029 (n=937), no_bbox=0.8571 (n=63)
+train[D_full]: 100%|█| 8000/8000 [1:32:15<00:00,  1.45it/s, loss=0.2404, lr=2.18e-10, op
+Answer Accuracy (val):
+  total   = 0.9000 (n=1000)
+  bbox    = 0.9029 (n=937)
+  no_bbox = 0.8571 (n=63)
+Trainable: 2,205,754,368 / 2,205,754,368 (100.0000%)
+Peak GPU memory: 30.45 GiB
+Train wall time: 2735.7 s
+
+取这里的best去评测 85.3 第一名
