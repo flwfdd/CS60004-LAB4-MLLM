@@ -1,0 +1,338 @@
+\documentclass[9pt,twocolumn,a4paper]{ctexart}
+
+\usepackage[a4paper,margin=1.35cm,top=1.45cm,bottom=1.55cm]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{graphicx}
+\usepackage{float}
+\usepackage{array}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{url}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=black,
+  citecolor=black,
+  urlcolor=blue
+}
+
+\newcommand{\metriccell}[3]{\begin{tabular}{@{}c@{}}#1\\#2\\#3\end{tabular}}
+
+\setlength{\columnsep}{0.55cm}
+\setlength{\parindent}{1em}
+\linespread{0.96}
+\setlength{\textfloatsep}{6pt plus 1pt minus 1pt}
+\setlength{\floatsep}{5pt plus 1pt minus 1pt}
+\setlength{\intextsep}{5pt plus 1pt minus 1pt}
+\captionsetup{font=small}
+\setlist[itemize]{leftmargin=1.2em,itemsep=1pt,topsep=2pt,parsep=0pt,partopsep=0pt}
+
+\title{\textbf{基于 InternVL2-2B 的多模态监督微调、合成数据构造与显式 Grounding 实验报告}}
+\author{甜菜酱饭炼丹坊\\田鑫芳 \and 蔡子晨 \and 姜证严 \and 范力文}
+\date{2024年5月}
+
+\begin{document}
+\maketitle
+\thispagestyle{empty}
+
+\begin{abstract}
+本报告围绕 InternVL2-2B 在视觉问答任务上的监督微调展开，系统完成了可训练模块控制、GQA 监督微调、由 COCO/LVIS 标注构造 instruction tuning 数据，以及显式利用 Bounding Box 提升视觉定位能力三项核心任务。实验首先表明，答案格式约束对短答案 VQA 的精确匹配评测具有决定性影响；在统一修正 prompt 后，仅训练 MLP Connector 即可获得 0.684 的验证准确率，而全参数微调达到 0.707。随后，我们设计文本驱动与图文联合两种教师模型数据构造方案，但其生成数据均未稳定超过原生 GQA 监督。最终，Task 3 证明显式 grounding 是最有效的增益来源：仅在推理时加入 bbox prompt，原始 InternVL2-2B 即可从 0.685 提升到 0.799；继续采用 bbox prompt 训练并引入 hard case 混合优化后，验证集准确率达到 0.906，Leaderboard 得分为 85.3。实验结论表明，对于本实验设定下的短答案 VQA，语言侧格式适配与显式定位信息比单纯增强视觉表征更重要。
+\end{abstract}
+
+\section{引言}
+多模态大语言模型（MLLM）将视觉编码器、跨模态连接模块与语言解码器统一到单一生成框架中，已成为视觉问答与通用视觉推理的重要范式。课程实验要求在单张 32GB 显存 GPU 上，以 InternVL2-2B 为基础模型，围绕 GQA 数据完成完整的多模态监督微调流程，并进一步探索合成 instruction 数据和显式定位信息对性能的影响。
+
+本实验的三个研究问题如下：1）不同可训练模块配置在效果与代价上如何权衡；2）由非 QA 标注数据构造的 instruction tuning 样本是否可以迁移到 GQA 风格短答案 VQA；3）显式 bbox 信息应以何种形式注入训练与推理，才能最大化定位敏感题收益。围绕这些问题，我们依次完成 Task 0--Task 3，并在实验过程中不断修正 prompt、训练超参数与数据配比，最终形成系统性消融分析。
+
+\section{实验设置}
+\subsection{模型与数据}
+基础模型为 InternVL2-2B（视觉编码器 InternViT-300M、连接器 MLP Connector、语言模型 InternLM2-1.8B），教师模型为 Qwen3-VL-8B-Instruct。Task 1 仅使用 GQA 的 \texttt{image/question/answer}；Task 2 使用 COCO caption 与 LVIS 类别、bbox 标注构造新样本，但最终输入不显式保留 bbox；Task 3 允许在训练与推理时显式使用 GQA bbox。
+
+\subsection{Task 0：模块参数控制}
+按照课程要求，我们实现了对 \texttt{vision\_model}、\texttt{mlp1} 和 \texttt{language\_model} 的可训练状态切换。表~\ref{tab:task0} 给出了四种配置的参数统计结果，为后续 Task 1 和 Task 3 的冻结实验奠定基础。
+
+\begin{table}[H]
+\centering
+\caption{Task 0 参数统计结果}
+\label{tab:task0}
+\scriptsize
+\begin{tabular}{lrrr}
+\toprule
+配置 & 总参数量 & 可训练参数量 & 占比 \\
+\midrule
+A: Connector & 2.206B & 12.60M & 0.5710\% \\
+B: Conn.+Lang. & 2.206B & 1.902B & 86.2173\% \\
+C: Vision+Conn. & 2.206B & 316.61M & 14.3537\% \\
+D: Full & 2.206B & 2.206B & 100.0000\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{评测与实现细节}
+验证指标为 Answer Accuracy，并分别报告总体、含 bbox 子集和不含 bbox 子集精度。实验早期发现，原始 prompt 常导致模型输出完整句子，例如把正确答案 ``green'' 扩展为 ``The grass is green.''，在精确匹配下被计为错误。因此后续统一使用如下修正模板：
+\begin{quote}
+\small
+\texttt{Question: \{question\} Answer with the shortest correct answer only.\\
+The answer must be a simple short answer, usually one word, a short phrase, yes/no, or a number.}
+\end{quote}
+这一改动将未微调 InternVL2-2B 的验证准确率由 0.247 提升到 0.685，说明当前任务的评测对输出格式极其敏感。一个典型失败样例如问题 ``Is the grass brown or green?''，模型给出 ``The grass is green.''，视觉理解本身正确，却因输出冗余而被精确匹配判错。这一现象直接改变了后续实验流程：我们放弃沿用最初 prompt 的全部中间结果，从 Task 1 起重新执行关键训练与评测，避免在错误评测口径上继续优化。
+
+\begin{table}[H]
+\centering
+\caption{Prompt 修正前后的基础模型对比}
+\label{tab:prompt-fix}
+\scriptsize
+\begin{tabular}{lccc}
+\toprule
+设置 & Total & BBox & No-BBox \\
+\midrule
+InternVL2-2B, 原始 prompt & 0.247 & 0.2487 & 0.2222 \\
+InternVL2-2B, 修正 prompt & 0.685 & 0.6756 & 0.8254 \\
+Qwen3-VL-8B, 原始 prompt & 0.685 & 0.6777 & 0.7937 \\
+Qwen3-VL-8B, 修正 prompt & 0.679 & 0.6692 & 0.8254 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{figure}[H]
+\centering
+\begin{subfigure}[t]{0.47\linewidth}
+\centering
+\includegraphics[width=\linewidth,height=0.18\textheight,keepaspectratio]{../images/task1_format_error_2386907.jpg}
+\caption{格式错误案例}
+\end{subfigure}\hfill
+\begin{subfigure}[t]{0.47\linewidth}
+\centering
+\includegraphics[width=\linewidth,height=0.18\textheight,keepaspectratio]{../images/task1_wandb.png}
+\caption{冻结实验训练曲线}
+\end{subfigure}
+\caption{Task 1 的两个关键观察：左图说明精确匹配对输出格式极为敏感；右图说明多组配置的 loss 都会快速下降，因此不能把低 loss 直接等价为视觉能力提升。}
+\label{fig:task1-cases}
+\end{figure}
+
+\section{Task 1：监督微调与冻结策略}
+\subsection{训练配置搜索}
+在 D\_full 上进行超参数探索后，我们观察到官方脚本的较大学习率并不适合当前任务。以修正 prompt 为前提，\texttt{bs16, lr=5e-6, 512 samples} 在训练开销和验证表现之间取得了较优平衡；进一步的基础设施优化也较为重要，包括启用 \texttt{gradient\_checkpointing}、采用梯度累积，以及将图像预处理改为 CPU/GPU 并行。对于 D\_full，512 样本训练时间由约 297s 降至 282s，启用 Flash Attention 后进一步降至 186s。更重要的是，超参数搜索揭示出一个经验事实：在样本规模有限且任务格式固定时，学习率过大比 batch size 过小更容易破坏性能，说明模型需要的是“温和适配”而不是“剧烈重写”。
+
+\begin{table}[H]
+\centering
+\caption{Task 1 中 D\_full 的代表性超参数搜索}
+\label{tab:task1-hparam}
+\scriptsize
+\begin{tabular}{lccp{0.17\linewidth}}
+\toprule
+设置 & Total & 时间 & 观察 \\
+\midrule
+bs128, lr4e-5, 1024 & 0.588 & 588s & 官方参数偏激进 \\
+bs32, lr1e-5, 1024 & 0.691 & 590s & 学习率进入有效区间 \\
+bs16, lr5e-6, 1024 & 0.695 & 593s & 小 batch 略优 \\
+bs16, lr5e-6, 512 & 0.699 & 297s & 样本减半不降反升 \\
+bs8, lr1e-6, 256 & 0.664 & 151s & 数据过少明显退化 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{冻结配置比较}
+在统一使用修正 prompt、\texttt{bs16, lr=5e-6, 512 samples} 的条件下，我们比较四种模块冻结方案，结果见表~\ref{tab:task1-main}。可以看到，A 仅训练 0.5710\% 参数仍达到 0.684，总体性能距离全参数方案仅差 2.3 个百分点，性价比极高；B 达到 0.701，已经非常接近 D 的 0.707；C 虽然更新了视觉编码器，但并未超过 B，表明在当前数据规模和问题形式下，语言侧格式适配的收益大于单独调整视觉表征。
+
+\begin{table}[H]
+\centering
+\caption{Task 1 不同冻结配置结果}
+\label{tab:task1-main}
+\scriptsize
+\begin{tabular}{lcccccc}
+\toprule
+配置 & Total & BBox & No-BBox & 占比 & 显存 & 时间 \\
+\midrule
+A Baseline & 0.685 & 0.6756 & 0.8254 & - & - & - \\
+A & 0.684 & 0.6756 & 0.8095 & 0.57\% & 18.38G & 141.9s \\
+B & 0.701 & 0.6926 & 0.8254 & 86.22\% & 19.39G & 176.4s \\
+C & 0.688 & 0.6798 & 0.8095 & 14.35\% & 20.41G & 229.5s \\
+D & \textbf{0.707} & \textbf{0.6980} & \textbf{0.8413} & 100\% & 21.66G & 282.0s \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+这一结果表明，MLP Connector 在跨模态对齐与输入格式适配中起到关键作用；全参数微调虽然性能最高，但收益与训练代价并不线性对应。因此，若目标是快速获得稳定基线，A 或 B 已具有较高实用价值。结合图~\ref{fig:task1-cases} 右侧曲线可见，多条训练配置都能在很短时间内把 loss 压低，这再次提醒我们：模型可能只是更好地模仿答案格式，而非真正学到了更强的视觉推理。
+
+\section{Task 2：由标注数据构造 Instruction 数据}
+\subsection{数据构造方案}
+Task 2 旨在将非 QA 的 COCO/LVIS 标注样本转换为可用于 instruction tuning 的多模态训练数据。我们设计了两种方案：A 为纯文字描述驱动，将 caption、类别和 bbox 文本交给教师模型生成样本；B 为图文联合驱动，在上述文本基础上再输入原图，使教师模型利用真实视觉证据纠偏。生成时要求每张图最多输出 8 条样本，覆盖图像描述、物体识别、计数、视觉摘要与空间关系等任务；同时严格过滤坐标泄漏、非法字段与重复样本。最终，基于 256 张图，A 理论上生成 2048 条、保留 1789 条，B 保留 1522 条。两种方案的共同约束包括：输出必须为 JSON 数组；字段仅保留 \texttt{task\_type/question/answer}；识别、计数与空间关系样本优先写成短答案 VQA；最终问题中不允许显式出现 bbox 坐标。这些限制本质上是在强迫教师模型向 GQA 分布靠拢。进一步在 1000 张图上构造偏 VQA 数据时，文本教师保留 1956 条、视觉教师保留 1927 条，合并后得到 3539 条样本，其中 \texttt{object/yes\_no} 占比最高（1100/946），而 \texttt{location/color} 类样本最少（81/163），说明仅靠自动构造很难自然得到足够多的细粒度定位题。
+
+\subsection{结果与分析}
+表~\ref{tab:task2-main} 给出 Task 2 的主要结果。无论单独使用合成数据，还是与 Task 1 的 GQA 数据混合训练，都未能稳定超过 GQA 原生监督基线。我们重跑 1024 样本设置后，Task 1 baseline 达到 0.704，而 A only、B only 分别为 0.691 与 0.687；混合训练的最优结果 1B\_1024 也仅为 0.699。
+
+\begin{table}[H]
+\centering
+\caption{Task 2 合成数据训练结果}
+\label{tab:task2-main}
+\scriptsize
+\begin{tabular}{lcccc}
+\toprule
+训练数据 & Total & BBox & No-BBox & 相对基线 \\
+\midrule
+Task 1 baseline & \textbf{0.704} & \textbf{0.6926} & \textbf{0.8730} & 0.000 \\
+A only & 0.691 & 0.6830 & 0.8095 & -0.013 \\
+B only & 0.687 & 0.6788 & 0.8095 & -0.017 \\
+A+B & 0.691 & 0.6830 & 0.8095 & -0.013 \\
+Task1+A & 0.697 & 0.6884 & 0.8254 & -0.007 \\
+Task1+B & 0.699 & 0.6905 & 0.8254 & -0.005 \\
+Task1+A+B & 0.695 & 0.6862 & 0.8254 & -0.009 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+我们认为其主要瓶颈在于分布偏差。GQA 验证更偏向短答案、精确匹配、目标明确的 VQA，而合成数据中包含大量 caption、summary 和开放式描述；即使 B 方案引入了更真实的视觉细节，也更容易产生 ``many'' 一类模糊答案，反而不利于当前评测。例如，在一个包含墓碑的样本中，A 方案会生成 ``How many gravestones are visible? $\rightarrow$ 3'' 这类更贴近短答案评测的计数问题；而 B 方案可能改写为包含场景细节的描述句，信息量更大但不利于精确匹配。另一个苹果/行李箱相关样本也表明，教师模型看图后虽然更接近真实视觉内容，却可能把标准计数任务改写为开放式估计。换言之，Task 2 的失败不是因为教师模型不强，而是因为目标分布与生成偏好不一致。这个阶段的最大收获是认识到，数据质量不能只看“自然度”和“丰富度”，还必须看其是否服务于最终评测格式。
+
+此外，我们在 Task 2 后期还尝试过更偏短回答 VQA 风格的数据重构，希望通过进一步收缩问题空间来减少分布差异，但依然没有带来稳定收益。这一负结果说明：如果模型真正缺的是定位证据，那么继续围绕弱监督合成 QA 打磨，只会进入收益递减区间。
+
+\begin{figure}[H]
+\centering
+\begin{subfigure}[t]{0.48\linewidth}
+\centering
+\includegraphics[width=\linewidth,height=0.17\textheight,keepaspectratio]{../images/task2_case_118838_labeled.jpg}
+\caption{case 118838}
+\end{subfigure}\hfill
+\begin{subfigure}[t]{0.48\linewidth}
+\centering
+\includegraphics[width=\linewidth,height=0.17\textheight,keepaspectratio]{../images/task2_case_388903_labeled.jpg}
+\caption{case 388903}
+\end{subfigure}
+\caption{Task 2 的典型样本。左例中，纯文本教师更容易生成贴近短答案评测的计数问题；右例中，视觉教师虽然更贴近真实场景，却更容易输出模糊量词或开放式描述。}
+\label{fig:task2-cases}
+\end{figure}
+
+\section{Task 3：显式利用 Bounding Box}
+\subsection{推理输入形式消融}
+Task 3 的核心假设是：Task 1 和 Task 2 的主要瓶颈来自视觉定位。验证集中 937/1000 个样本携带 bbox，因此 grounding 潜在收益很大。更细地看，bbox 数量分布为 0/1/2/3/4 个目标分别对应 63/394/451/91/1 个样本，这意味着大多数问题都需要在多目标环境下完成对象绑定。我们首先在不训练模型的情况下，系统比较 bbox 信息的输入形式，包括纯文本坐标、颜色提示、图上画框与图上标签等。结果表明，文本化 bbox 是最稳定、最有效的方案：原始 InternVL2-2B 从 \texttt{no\_bbox + original} 的 0.685 提升到 \texttt{bbox\_prompt + original} 的 0.799；若仅画框而不提供足够文本上下文，性能反而下降。说明对 InternVL2-2B 而言，结构化对象文本比额外视觉噪声更有效。一个有代表性的关系推理问题是 ``床垫在台灯所在桌子的左边还是右边''。若仅输入原图，模型需要先隐式完成多个目标的定位与绑定；而 bbox prompt 直接把 ``lamp/table/mattress'' 的候选区域写入上下文，显著降低了对象指代歧义。
+
+\begin{table}[H]
+\centering
+\caption{Task 3 推理阶段 Prompt $\times$ 图像形式二维消融}
+\label{tab:task3-2d}
+\scriptsize
+\setlength{\tabcolsep}{2.4pt}
+\renewcommand{\arraystretch}{1.02}
+\resizebox{\linewidth}{!}{%
+\begin{tabular}{lcccc}
+\toprule
+Prompt $\backslash$ Image & original & same box & color box & color box label \\
+\midrule
+no\_bbox & \metriccell{0.685}{0.6756}{0.8254} & \metriccell{0.668}{0.6574}{0.8254} & \metriccell{0.670}{0.6596}{0.8254} & \metriccell{0.796}{0.7940}{0.8254} \\
+bbox\_prompt & \metriccell{\textbf{0.799}}{\textbf{0.7972}}{0.8254} & \metriccell{0.781}{0.7780}{0.8254} & \metriccell{0.781}{0.7780}{0.8254} & \metriccell{0.790}{0.7876}{0.8254} \\
+color\_prompt & \metriccell{0.798}{0.7962}{0.8254} & \metriccell{0.782}{0.7791}{0.8254} & \metriccell{0.772}{0.7684}{0.8254} & \metriccell{0.779}{0.7759}{0.8254} \\
+color\_bbox & \metriccell{0.798}{0.7962}{0.8254} & \metriccell{0.758}{0.7535}{0.8254} & \metriccell{0.756}{0.7513}{0.8254} & \metriccell{0.790}{0.7876}{0.8254} \\
+\bottomrule
+\end{tabular}
+\par}
+\end{table}
+
+表~\ref{tab:task3-2d} 呈现出四点稳定结论。首先，最优单元是 \texttt{bbox\_prompt + original}，说明显式坐标文本已经足以提供稳定 grounding。其次，\texttt{no\_bbox + color\_box\_label} 从 0.685 跳到 0.796，说明图上标签本身就是强文本先验。再次，\texttt{color\_prompt + original} 几乎追平 \texttt{bbox\_prompt + original}，这意味着即使没有坐标，只给出对象类别文本，也能减少同义词和指代歧义。最后，一旦 prompt 中已经包含 bbox 信息，继续额外画框通常不会带来增益，反而更容易引入视觉噪声。
+
+\begin{figure}[H]
+\centering
+\begin{subfigure}[t]{0.31\linewidth}
+\centering
+\includegraphics[width=\linewidth,height=0.12\textheight,keepaspectratio]{../images/task3_0953938_same_box.jpg}
+\caption{\texttt{same\_box}}
+\end{subfigure}\hfill
+\begin{subfigure}[t]{0.31\linewidth}
+\centering
+\includegraphics[width=\linewidth,height=0.12\textheight,keepaspectratio]{../images/task3_0953938_color_box.jpg}
+\caption{\texttt{color\_box}}
+\end{subfigure}\hfill
+\begin{subfigure}[t]{0.31\linewidth}
+\centering
+\includegraphics[width=\linewidth,height=0.12\textheight,keepaspectratio]{../images/task3_0953938_color_box_label.jpg}
+\caption{\texttt{color\_box\_label}}
+\end{subfigure}
+\caption{Task 3 的三种图像侧可视化方案。实验表明，单纯画框帮助有限，真正稳定的增益来自标签文本与结构化 prompt 的配合。}
+\label{fig:task3-box}
+\end{figure}
+
+\subsection{训练阶段的 bbox 适配}
+在证明 bbox prompt 本身有效后，我们继续在训练阶段引入该输入格式。表~\ref{tab:task3-freeze} 展示了四种冻结配置在 bbox prompt 下的表现。与 Task 1 类似，D\_full 最高，为 0.872；但 B 仅略低于 D，说明在显式 bbox 设定下，语言模型对结构化定位文本的适配依然最关键，而单独更新视觉编码器的收益较小。另一项重要观察是：即便不重新训练，只在 Task 1 的 no-bbox 模型上切换到 bbox prompt 推理，也可直接达到 0.832，这说明 Task 3 的第一性增益来自输入信息本身，而不是训练技巧。
+
+\begin{table}[H]
+\centering
+\caption{bbox prompt 训练下的冻结配置结果}
+\label{tab:task3-freeze}
+\scriptsize
+\begin{tabular}{lcccccc}
+\toprule
+配置 & Total & BBox & No-BBox & 占比 & 显存 & 时间 \\
+\midrule
+A Baseline & 0.799 & 0.7972 & 0.8254 & - & - & - \\
+A & 0.855 & 0.8581 & 0.8095 & 0.57\% & 19.17G & 274s \\
+B & 0.869 & 0.8719 & 0.8254 & 86.22\% & 19.36G & 376s \\
+C & 0.853 & 0.8538 & 0.8413 & 14.35\% & 21.20G & 499s \\
+D & \textbf{0.872} & \textbf{0.8751} & 0.8254 & 100\% & 21.63G & 603s \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Hard Case 与最终结果}
+在 Task 3 的大规模训练中，我们进一步引入 hard case 机制。首先用原始模型以 bbox prompt 评估 8000 条训练数据，得到 0.8045 的训练集正确率，并筛出 1564 条错误样本。若从更细的类型分布看，错误样本主要集中在 \texttt{object\_attribute}（611）、\texttt{other}（592）、\texttt{yes\_no}（546）和 \texttt{spatial}（477），说明即使显式加入 bbox，属性判断与关系推理仍是最难部分。单独训练 hard cases 的效果并不理想，这说明困难样本虽然信息密度高，但也更容易造成分布偏移；将其与 Task 1/Task 3 常规样本混合后，才能更有针对性地提升定位难题表现。最终采用三阶段流程：1）在 8000 条 bbox prompt 数据上训练；2）混合 hard cases 再训练；3）回到打乱后的常规 8000 条样本恢复分布。表~\ref{tab:task3-final} 给出了逐步结果。
+
+另有两项补充实验也值得记录。其一，参考 VoCoT 设计的 bbox-aware CoT 在当前任务上并不成功，Qwen 在 100 条样本上的 \texttt{bbox\_prompt} 为 0.840，而 CoT 下降到 0.810，说明推理链条越长越可能偏离精确匹配格式。其二，教师模型比较表明 Qwen3-VL-8B 在 \texttt{no\_bbox + original}、\texttt{bbox\_prompt + original}、\texttt{color\_bbox\_prompt + color\_box\_label} 下分别为 0.679、0.842 和 0.844；虽然整体强于未微调 InternVL2-2B，但仍未超过后续微调后的 InternVL2-2B 最优方案，因此后续路线依然聚焦 InternVL2-2B。
+
+\begin{table}[H]
+\centering
+\caption{Task 3 最终训练流程结果}
+\label{tab:task3-final}
+\scriptsize
+\begin{tabular}{p{0.41\linewidth}ccc}
+\toprule
+训练设置 & Total & BBox & No-BBox \\
+\midrule
+原始模型 + bbox prompt 推理 & 0.799 & 0.7972 & 0.8254 \\
+task3 8000, bs16, lr1e-5 & 0.890 & 0.8922 & 0.8571 \\
+task1/3 hard 3128, bs16, lr5e-6 & 0.894 & 0.8954 & 0.8730 \\
+task3 shuffle 8000, bs64, lr5e-6 & \textbf{0.906} & \textbf{0.9082} & \textbf{0.8730} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+最终方案在验证集达到 0.906，较 Task 1 最优 D\_full 基线提升 19.9 个百分点，且提升几乎完全来自 bbox 子集；Leaderboard 最终得分为 85.3，排名第一。训练日志还显示，第三阶段中最优 checkpoint 出现在 step 100，此时 Total/BBox/No-BBox 分别达到 0.906/0.9082/0.8730，而继续训练后总体精度略有回落，说明在显式 grounding 设定下模型同样存在过拟合风险。与此同时，参考 VoCoT 设计的 bbox-aware CoT 并未带来提升，在 100 条样本上的准确率由 0.840 降至 0.810，说明对当前以短答案精确匹配为主的任务而言，显式、简洁的结构化定位信息优于冗长推理链。从实验心路上看，Task 3 的突破也纠正了我们在 Task 2 的一个惯性思维：不是所有性能瓶颈都应通过“更强教师、更复杂数据”来解决，有时直接把缺失的关键信息显式提供给模型，反而是最有效的方案。
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.97\linewidth]{../images/task3_wandb.png}
+\caption{Task 3 最终阶段训练曲线。模型在加入显式 grounding 后能够快速收敛到更高精度区间。}
+\label{fig:task3-wandb}
+\end{figure}
+
+\section{结论}
+本实验系统比较了模块冻结、合成数据构造和显式 grounding 三类方法对 InternVL2-2B 的影响，得到如下结论。第一，视觉编码器并非总是最值得优先微调的部分；在当前短答案 VQA 设定下，语言侧格式适配更关键。第二，MLP Connector 虽参数量极小，但承担了跨模态对齐与输入格式映射的重要作用，具有极高性价比。第三，由 COCO/LVIS 标注构造 instruction 数据在方法上是可行的，但若目标评测是 GQA 风格精确匹配短答案 VQA，则合成数据面临明显分布偏差。第四，显式 bbox grounding 是本实验最稳定、最强的增益来源，其中简洁的 bbox prompt 比复杂可视化和 CoT 更有效。第五，训练与推理阶段的 bbox 表达形式一致性十分重要，Task 3 的最佳结果正是建立在“推理格式先验证有效，再将同一格式用于训练”这一策略之上。
+
+从工程角度看，本实验也说明前期 prompt 设计、训练基础设施优化与系统消融同样重要。尤其值得反思的是，若在早期没有及时发现输出格式问题，后续大量训练都可能建立在错误结论之上；而一旦基础设施效率不足，也难以支撑足够多的消融实验去定位真正有效的因素。最终最优方案并不复杂，但其形成依赖于对失败设定的充分排查与验证。后续工作可继续探索更紧凑的区域表示、更高质量的 bbox-aware 数据构造，以及兼顾开放式描述与短答案评测的多目标训练策略。
+
+\begingroup
+\footnotesize
+\begin{thebibliography}{9}
+\bibitem{internvl}
+OpenGVLab. InternVL: Scaling up Vision Foundation Models and Aligning for Generic Visual-Linguistic Tasks.
+
+\bibitem{qwen3vl}
+Qwen Team. Qwen3-VL Technical Report.
+
+\bibitem{llava}
+Haotian Liu, Chunyuan Li, Yuheng Li, and Yong Jae Lee. Visual Instruction Tuning. NeurIPS, 2023.
+
+\bibitem{vocot}
+Yue Zhang et al. VoCoT: Unleashing Visually Grounded Multi-Step Reasoning in Large Multi-Modal Models. arXiv:2405.16919, 2024.
+
+\bibitem{gqa}
+Drew A. Hudson and Christopher D. Manning. GQA: A New Dataset for Real-World Visual Reasoning and Compositional Question Answering. CVPR, 2019.
+
+\bibitem{lvis}
+Agrim Gupta, Piotr Dollar, and Ross Girshick. LVIS: A Dataset for Large Vocabulary Instance Segmentation. CVPR, 2019.
+\end{thebibliography}
+\endgroup
+
+\end{document}
