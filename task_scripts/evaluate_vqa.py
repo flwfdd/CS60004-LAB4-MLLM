@@ -113,7 +113,6 @@ def vote_predictions(raw_predictions: list[str], mode: str) -> tuple[str, list[s
 
 def build_prompt(row: dict[str, Any], mode: str, max_bboxes: int) -> str:
     format_prompt = "The answer must be a simple short answer, usually one word, a short phrase, yes/no, or a number."
-    format_prompt = ""
     question = row["question"].strip()
     if mode == "cot":
         prefix = ""
