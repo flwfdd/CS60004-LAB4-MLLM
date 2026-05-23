@@ -1,19 +1,13 @@
-"""
-Task 1：InternVL2-2B 在 GQA VQA 上按一种冻结策略做监督微调
-"""
-
-from __future__ import annotations
-
 import json
 import sys
 import time
 from pathlib import Path
-from types import SimpleNamespace
+from types import SimpleNamespace as NS
 
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, Dataset
 from PIL import Image
+from torch.utils.data import DataLoader, Dataset
 from tqdm.auto import tqdm
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -25,315 +19,243 @@ from evaluate_vqa import build_prompt, exact_match, internvl_dynamic_tile_pixel_
 from task0 import count_parameters, set_trainable_modules
 
 
-def load_jsonl(path: Path) -> list[dict]:
-    with path.open(encoding="utf-8") as f:
-        return [json.loads(line) for line in f if line.strip()]
+def read_jsonl(fn):
+    ans = []
+    with Path(fn).open(encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                ans.append(json.loads(line))
+    return ans
 
 
-def load_mixed_train_rows(paths: list[str], max_samples: int) -> list[dict]:
-    """按 1:1:... 从多个 jsonl 取样"""
-    datasets = [load_jsonl(Path(p)) for p in paths]
-    n_src = len(datasets)
-    if n_src == 0:
+def interleave_files(files, max_n):
+    pools = [read_jsonl(x) for x in files]
+    if not pools:
         raise ValueError("train_jsonl 不能为空")
 
-    total = max_samples if max_samples > 0 else min(map(len, datasets)) * n_src
-    base, rem = divmod(total, n_src)
-    quotas = [base + int(i < rem) for i in range(n_src)]
-    for path, rows, quota in zip(paths, datasets, quotas):
-        if len(rows) < quota:
-            raise ValueError(f"{path} 只有 {len(rows)} 条，不足以按比例取 {quota} 条。")
+    k = len(pools)
+    if max_n and max_n > 0:
+        each, left = divmod(max_n, k)
+        need = [each + (i < left) for i in range(k)]
+    else:
+        m = min(len(x) for x in pools)
+        need = [m] * k
+
+    for fn, rows, n in zip(files, pools, need):
+        if len(rows) < n:
+            raise ValueError(f"{fn}: 只有 {len(rows)} 条，不够取 {n} 条")
 
     mixed = []
-    for j in range(max(quotas)):
-        for rows, quota in zip(datasets, quotas):
-            if j < quota:
-                mixed.append(rows[j])
+    for i in range(max(need)):
+        for rows, n in zip(pools, need):
+            if i < n:
+                mixed.append(rows[i])
     return mixed
 
 
-def resolve_image(rel: str, image_root: Path) -> Path:
-    return (image_root / rel.lstrip("/")).resolve()
+def image_path(name, root):
+    return (Path(root) / str(name).lstrip("/")).resolve()
 
 
-def _pad_to(t: torch.Tensor, length: int, value: int) -> torch.Tensor:
-    if t.shape[0] >= length:
-        return t[:length]
-    pad = torch.full((length - t.shape[0],), value, dtype=t.dtype)
-    return torch.cat([t, pad], dim=0)
+def pad_1d(x, n, val):
+    if x.numel() >= n:
+        return x[:n]
+    return torch.cat([x, torch.full((n - x.numel(),), val, dtype=x.dtype)], 0)
 
 
-class TrainRowsDataset(Dataset):
-    def __init__(self, rows: list[dict]):
+class Rows(Dataset):
+    def __init__(self, rows):
         self.rows = rows
 
-    def __len__(self) -> int:
+    def __len__(self):
         return len(self.rows)
 
-    def __getitem__(self, idx: int) -> dict:
-        return self.rows[idx]
+    def __getitem__(self, i):
+        return self.rows[i]
 
 
-def tokenize_sft(
-    tokenizer,
-    *,
-    template_name: str,
-    system_message: str,
-    num_image_token: int,
-    num_patches: int,
-    prompt: str,
-    answer: str,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    user_msg = f"<image>\n{prompt.strip()}"
-    template = get_conv_template(template_name)
-    template.system_message = system_message
-    template.append_message(template.roles[0], user_msg)
-    template.append_message(template.roles[1], None)
-    prefix = template.get_prompt()
-    img_tokens = "<img>" + "<IMG_CONTEXT>" * num_image_token * num_patches + "</img>"
-    prefix = prefix.replace("<image>", img_tokens, 1)
-    suffix = answer.strip() + template.sep
-    full = prefix + suffix
+def sft_tokens(tok, template_name, sys_msg, img_tok_n, patch_n, question, answer):
+    conv = get_conv_template(template_name)
+    conv.system_message = sys_msg
+    conv.append_message(conv.roles[0], "<image>\n" + question.strip())
+    conv.append_message(conv.roles[1], None)
 
-    pref = tokenizer(prefix, return_tensors="pt", add_special_tokens=True)
-    full_t = tokenizer(full, return_tensors="pt", add_special_tokens=True)
-    input_ids = full_t.input_ids
-    attention_mask = full_t.attention_mask
-    plen = pref.input_ids.shape[1]
-    if not torch.equal(input_ids[:, :plen], pref.input_ids):
-        raise ValueError("SFT 前缀与整句 token 边界不一致，请检查模板与分词器。")
-    labels = input_ids.clone()
+    prefix = conv.get_prompt()
+    img = "<img>" + "<IMG_CONTEXT>" * (img_tok_n * patch_n) + "</img>"
+    prefix = prefix.replace("<image>", img, 1)
+    full = prefix + answer.strip() + conv.sep
+
+    a = tok(prefix, return_tensors="pt", add_special_tokens=True)
+    b = tok(full, return_tensors="pt", add_special_tokens=True)
+    plen = a.input_ids.shape[1]
+    if not torch.equal(b.input_ids[:, :plen], a.input_ids):
+        raise RuntimeError("tokenizer 把 prefix/full 切坏了")
+
+    labels = b.input_ids.clone()
     labels[:, :plen] = -100
-    labels[attention_mask == 0] = -100
-    return input_ids, attention_mask, labels
+    labels[b.attention_mask == 0] = -100
+    return b.input_ids, b.attention_mask, labels
 
 
-class TrainBatchCollator:
-    def __init__(
-        self,
-        tokenizer,
-        *,
-        template_name: str,
-        system_message: str,
-        num_image_token: int,
-        image_root: Path,
-        max_tiles: int,
-        prompt_mode: str,
-        max_bboxes: int,
-    ):
-        self.tokenizer = tokenizer
-        self.template_name = template_name
-        self.system_message = system_message
-        self.num_image_token = num_image_token
-        self.image_root = image_root
-        self.max_tiles = max_tiles
-        self.prompt_mode = prompt_mode
-        self.max_bboxes = max_bboxes
+class TrainCollate:
+    def __init__(self, tok, model, cfg, image_root):
+        self.tok = tok
+        self.template = model.template
+        self.sys_msg = model.system_message
+        self.img_tok_n = model.num_image_token
+        self.root = Path(image_root)
+        self.cfg = cfg
 
-    def __call__(self, rows: list[dict]) -> dict[str, torch.Tensor | int]:
-        """在 worker 中完成图片预处理、prompt 构造与 tokenization。"""
-        pad_id = (
-            self.tokenizer.pad_token_id
-            if self.tokenizer.pad_token_id is not None
-            else 0
-        )
-        pv_list, ids_list, mask_list, lbl_list = [], [], [], []
+    def __call__(self, rows):
+        pad_id = self.tok.pad_token_id if self.tok.pad_token_id is not None else 0
+        pixels, ids, masks, labels = [], [], [], []
 
-        for row in rows:
-            question = row.get("question")
-            answer = row.get("answer")
-            if question is None or answer is None:
-                raise KeyError("训练样本必须包含 question/answer 字段。")
+        for r in rows:
+            q, a = r.get("question"), r.get("answer")
+            if q is None or a is None:
+                raise KeyError("训练数据要有 question/answer")
 
-            path = resolve_image(row["image"], self.image_root)
-            if not path.is_file():
-                raise FileNotFoundError(
-                    f"找不到图像：{path}\n请检查 cfg.image_root 与 jsonl 中的相对路径。"
-                )
-            with Image.open(path) as image:
+            fn = image_path(r["image"], self.root)
+            if not fn.is_file():
+                raise FileNotFoundError(f"图像不存在: {fn}")
+            with Image.open(fn) as im:
                 pv = internvl_dynamic_tile_pixel_values(
-                    image.convert("RGB"), max_tiles=self.max_tiles
+                    im.convert("RGB"), max_tiles=self.cfg.max_tiles
                 ).to(dtype=torch.bfloat16)
-            ids, mask, lbl = tokenize_sft(
-                self.tokenizer,
-                template_name=self.template_name,
-                system_message=self.system_message,
-                num_image_token=self.num_image_token,
-                num_patches=pv.shape[0],
-                prompt=build_prompt(row, self.prompt_mode, max_bboxes=self.max_bboxes),
-                answer=str(answer),
-            )
-            pv_list.append(pv)
-            ids_list.append(ids.squeeze(0))
-            mask_list.append(mask.squeeze(0))
-            lbl_list.append(lbl.squeeze(0))
 
-        max_len = max(t.shape[0] for t in ids_list)
-        input_ids = torch.stack([_pad_to(t, max_len, pad_id) for t in ids_list])
-        attention_mask = torch.stack([_pad_to(t, max_len, 0) for t in mask_list])
-        labels = torch.stack([_pad_to(t, max_len, -100) for t in lbl_list])
-        pixel_values = torch.cat(pv_list, dim=0)
-        image_flags = torch.ones(pixel_values.shape[0], dtype=torch.long)
+            prompt = build_prompt(r, self.cfg.prompt_mode, max_bboxes=self.cfg.max_bboxes)
+            x, m, y = sft_tokens(
+                self.tok,
+                self.template,
+                self.sys_msg,
+                self.img_tok_n,
+                pv.shape[0],
+                prompt,
+                str(a),
+            )
+            pixels.append(pv)
+            ids.append(x.squeeze(0))
+            masks.append(m.squeeze(0))
+            labels.append(y.squeeze(0))
+
+        n = max(x.shape[0] for x in ids)
+        pix = torch.cat(pixels, 0)
         return {
-            "pixel_values": pixel_values,
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
-            "labels": labels,
-            "image_flags": image_flags,
+            "pixel_values": pix,
+            "input_ids": torch.stack([pad_1d(x, n, pad_id) for x in ids]),
+            "attention_mask": torch.stack([pad_1d(x, n, 0) for x in masks]),
+            "labels": torch.stack([pad_1d(x, n, -100) for x in labels]),
+            "image_flags": torch.ones(pix.shape[0], dtype=torch.long),
             "sample_count": len(rows),
         }
 
 
-class EvalBatchCollator:
-    def __init__(
-        self,
-        image_root: Path,
-        *,
-        max_tiles: int,
-        prompt_mode: str,
-        max_bboxes: int,
-    ):
-        self.image_root = image_root
-        self.max_tiles = max_tiles
-        self.prompt_mode = prompt_mode
-        self.max_bboxes = max_bboxes
+class ValCollate:
+    def __init__(self, cfg, image_root):
+        self.cfg = cfg
+        self.root = Path(image_root)
 
-    def __call__(self, rows: list[dict]) -> dict[str, object]:
-        pv_list, num_patches_list, questions = [], [], []
-        for row in rows:
-            path = resolve_image(row["image"], self.image_root)
-            if not path.is_file():
-                raise FileNotFoundError(
-                    f"找不到图像：{path}\n请检查 cfg.image_root 与 jsonl 中的相对路径。"
-                )
-            with Image.open(path) as image:
+    def __call__(self, rows):
+        pixels, patches, questions = [], [], []
+        for r in rows:
+            fn = image_path(r["image"], self.root)
+            if not fn.is_file():
+                raise FileNotFoundError(f"图像不存在: {fn}")
+            with Image.open(fn) as im:
                 pv = internvl_dynamic_tile_pixel_values(
-                    image.convert("RGB"), max_tiles=self.max_tiles
+                    im.convert("RGB"), max_tiles=self.cfg.max_tiles
                 ).to(dtype=torch.bfloat16)
-            pv_list.append(pv)
-            num_patches_list.append(pv.shape[0])
+            pixels.append(pv)
+            patches.append(pv.shape[0])
             questions.append(
-                build_prompt(row, self.prompt_mode, max_bboxes=self.max_bboxes)
+                build_prompt(r, self.cfg.prompt_mode, max_bboxes=self.cfg.max_bboxes)
             )
         return {
             "rows": rows,
-            "pixel_values": torch.cat(pv_list, dim=0),
-            "num_patches_list": num_patches_list,
+            "pixel_values": torch.cat(pixels, 0),
+            "num_patches_list": patches,
             "questions": questions,
             "sample_count": len(rows),
         }
 
 
-@torch.inference_mode()
-def val_accuracy(
-    model,
-    tokenizer,
-    rows: list[dict],
-    image_root: Path,
-    device: torch.device,
-    *,
-    max_tiles: int,
-    limit: int,
-    max_new_tokens: int,
-    prompt_mode: str,
-    max_bboxes: int,
-    batch_size: int = 1,
-    num_workers: int = 0,
-    prefetch_factor: int = 2,
-    pin_memory: bool = True,
-    desc: str = "eval",
-) -> dict:
-    """返回 dict: total / bbox / no_bbox 三档准确率以及样本数。
-
-    batch_size>1 时走 InternVL2 自带的 batch_chat，一次性把多个样本的 tile
-    在 ViT 上拼接做特征提取，并在 LLM 上做左 pad 的并行生成。
-    """
-    was_training = model.training
-    model.eval()
-    correct_total = correct_bbox = correct_no = 0
-    n_total = n_bbox = n_no = 0
-    subset = rows[:limit]
-    gen_cfg = dict(max_new_tokens=max_new_tokens, do_sample=False)
-    bs = max(int(batch_size), 1)
-    collator = EvalBatchCollator(
-        image_root,
-        max_tiles=max_tiles,
-        prompt_mode=prompt_mode,
-        max_bboxes=max_bboxes,
+def loader_args(collate, batch, workers, cfg, shuffle=False, drop_last=False):
+    kw = dict(
+        batch_size=batch,
+        shuffle=shuffle,
+        drop_last=drop_last,
+        num_workers=max(int(workers), 0),
+        collate_fn=collate,
+        pin_memory=bool(cfg.pin_memory),
     )
-    loader_kwargs = {
-        "batch_size": bs,
-        "shuffle": False,
-        "num_workers": max(int(num_workers), 0),
-        "collate_fn": collator,
-        "pin_memory": bool(pin_memory),
-    }
-    if loader_kwargs["num_workers"] > 0:
-        loader_kwargs["prefetch_factor"] = max(int(prefetch_factor), 1)
-        loader_kwargs["persistent_workers"] = True
-    loader = DataLoader(TrainRowsDataset(subset), **loader_kwargs)
+    if kw["num_workers"] > 0:
+        kw["prefetch_factor"] = max(int(cfg.prefetch_factor), 1)
+        kw["persistent_workers"] = True
+    return kw
 
-    bar = tqdm(total=len(subset), desc=desc, leave=False, dynamic_ncols=True)
-    for batch in loader:
-        chunk = batch["rows"]
-        pixel_values = batch["pixel_values"].to(device=device, non_blocking=True)
-        preds = [
-            p.strip()
-            for p in model.batch_chat(
-                tokenizer,
-                pixel_values,
-                batch["questions"],
-                gen_cfg,
-                num_patches_list=batch["num_patches_list"],
-            )
-        ]
 
-        for row, pred in zip(chunk, preds):
-            ok = exact_match(pred, str(row["answer"]))
-            has_bbox = bool(row.get("bboxes"))
-            n_total += 1
-            correct_total += int(ok)
-            if has_bbox:
-                n_bbox += 1
-                correct_bbox += int(ok)
+@torch.inference_mode()
+def eval_acc(model, tok, rows, cfg, image_root, device, limit, desc="eval"):
+    old_train = model.training
+    model.eval()
+
+    rows = rows[:limit]
+    good = good_box = good_plain = 0
+    n = n_box = n_plain = 0
+    gen_cfg = dict(max_new_tokens=cfg.max_new_tokens, do_sample=False)
+
+    bs = max(int(cfg.eval_batch_size), 1)
+    dl = DataLoader(
+        Rows(rows),
+        **loader_args(ValCollate(cfg, image_root), bs, cfg.num_workers, cfg),
+    )
+
+    bar = tqdm(total=len(rows), desc=desc, leave=False, dynamic_ncols=True)
+    for batch in dl:
+        pv = batch["pixel_values"].to(device=device, non_blocking=True)
+        out = model.batch_chat(
+            tok,
+            pv,
+            batch["questions"],
+            gen_cfg,
+            num_patches_list=batch["num_patches_list"],
+        )
+        out = [x.strip() for x in out]
+
+        for r, pred in zip(batch["rows"], out):
+            ok = exact_match(pred, str(r["answer"]))
+            has_box = bool(r.get("bboxes"))
+            n += 1
+            good += int(ok)
+            if has_box:
+                n_box += 1
+                good_box += int(ok)
             else:
-                n_no += 1
-                correct_no += int(ok)
+                n_plain += 1
+                good_plain += int(ok)
 
         bar.update(int(batch["sample_count"]))
-        bar.set_postfix(acc=f"{correct_total / n_total:.3f}")
+        bar.set_postfix(acc=f"{good / max(n, 1):.3f}")
     bar.close()
-    if was_training:
+
+    if old_train:
         model.train()
 
-    def _ratio(c: int, n: int) -> float:
-        return c / n if n else 0.0
-
+    div = lambda a, b: a / b if b else 0.0
     return {
-        "accuracy": _ratio(correct_total, n_total),
-        "accuracy_bbox": _ratio(correct_bbox, n_bbox),
-        "accuracy_no_bbox": _ratio(correct_no, n_no),
-        "n_total": n_total,
-        "n_bbox": n_bbox,
-        "n_no_bbox": n_no,
+        "accuracy": div(good, n),
+        "accuracy_bbox": div(good_box, n_box),
+        "accuracy_no_bbox": div(good_plain, n_plain),
+        "n_total": n,
+        "n_bbox": n_box,
+        "n_no_bbox": n_plain,
     }
 
 
-def train_one_config(
-    cfg_name: str,
-    train_cfg: dict,
-    cfg: SimpleNamespace,
-    device: torch.device,
-    image_root: Path,
-    *,
-    log_wandb: bool = False,
-) -> dict:
-    from transformers import (
-        AutoModel,
-        AutoTokenizer,
-        get_constant_schedule,
-        get_cosine_schedule_with_warmup,
-    )
+def run_one(name, train_bits, cfg, device, image_root, log_wandb=False):
+    from transformers import AutoModel, AutoTokenizer
+    from transformers import get_constant_schedule, get_cosine_schedule_with_warmup
 
     torch.cuda.reset_peak_memory_stats(device)
 
@@ -344,388 +266,251 @@ def train_one_config(
         use_flash_attn=True,
         low_cpu_mem_usage=False,
     )
-    tokenizer = AutoTokenizer.from_pretrained(
-        cfg.model_path, trust_remote_code=True, use_fast=False
-    )
+    tok = AutoTokenizer.from_pretrained(cfg.model_path, trust_remote_code=True, use_fast=False)
     model.language_model.config.use_cache = False
-    model.img_context_token_id = tokenizer.convert_tokens_to_ids("<IMG_CONTEXT>")
-    model = set_trainable_modules(model, **train_cfg).to(device)
-    # 默认先全部关掉，再按 train_cfg 选择性开启，避免给被冻结的子模块上无意义的 GC
+    model.img_context_token_id = tok.convert_tokens_to_ids("<IMG_CONTEXT>")
+    model = set_trainable_modules(model, **train_bits).to(device)
+
     if hasattr(model, "gradient_checkpointing_disable"):
         model.gradient_checkpointing_disable()
     if cfg.gradient_checkpointing:
-        # 用 HF 官方的递归 enable 才能传到 InternVisionEncoder / InternLM2Model 这种内部子模块
-        def _enable_gc(submodule):
+        def gc_on(m):
             try:
-                submodule.gradient_checkpointing_enable(
+                m.gradient_checkpointing_enable(
                     gradient_checkpointing_kwargs={"use_reentrant": False}
                 )
             except TypeError:
-                submodule.gradient_checkpointing_enable()
+                m.gradient_checkpointing_enable()
 
-        if train_cfg.get("train_vision", False):
-            _enable_gc(model.vision_model)
-        if train_cfg.get("train_language", False):
-            _enable_gc(model.language_model)
-            # GC 要求至少一路输入张量 requires_grad，否则 backward 不会重算激活
+        if train_bits.get("train_vision"):
+            gc_on(model.vision_model)
+        if train_bits.get("train_language"):
+            gc_on(model.language_model)
             if hasattr(model.language_model, "enable_input_require_grads"):
                 model.language_model.enable_input_require_grads()
     model.train()
 
     if cfg.batch_size <= 0 or cfg.micro_batch_size <= 0:
-        raise ValueError("batch_size 与 micro_batch_size 必须为正整数。")
-    if cfg.batch_size % cfg.micro_batch_size != 0:
-        raise ValueError(
-            f"batch_size({cfg.batch_size}) 必须是 micro_batch_size({cfg.micro_batch_size}) 的整数倍。"
-        )
-    accumulation_steps = cfg.batch_size // cfg.micro_batch_size
+        raise ValueError("batch_size/micro_batch_size 必须是正数")
+    if cfg.batch_size % cfg.micro_batch_size:
+        raise ValueError("batch_size 要能被 micro_batch_size 整除")
+    grad_acc = cfg.batch_size // cfg.micro_batch_size
 
-    total, trainable, ratio = count_parameters(model)
-    train_rows = load_mixed_train_rows(cfg.train_jsonl, cfg.max_train_samples)
-    train_dataset = TrainRowsDataset(train_rows)
-    train_collator = TrainBatchCollator(
-        tokenizer,
-        template_name=model.template,
-        system_message=model.system_message,
-        num_image_token=model.num_image_token,
-        image_root=image_root,
-        max_tiles=cfg.max_tiles,
-        prompt_mode=cfg.prompt_mode,
-        max_bboxes=cfg.max_bboxes,
+    total_p, train_p, train_ratio = count_parameters(model)
+    train_rows = interleave_files(cfg.train_jsonl, cfg.max_train_samples)
+    val_rows = read_jsonl(cfg.val_jsonl)
+
+    train_dl = DataLoader(
+        Rows(train_rows),
+        **loader_args(
+            TrainCollate(tok, model, cfg, image_root),
+            cfg.micro_batch_size,
+            cfg.num_workers,
+            cfg,
+            shuffle=False,
+            drop_last=True,
+        ),
     )
-    train_loader_kwargs = {
-        "batch_size": cfg.micro_batch_size,
-        "shuffle": False,
-        "drop_last": True,
-        "num_workers": max(int(cfg.num_workers), 0),
-        "collate_fn": train_collator,
-        "pin_memory": bool(cfg.pin_memory),
-    }
-    if train_loader_kwargs["num_workers"] > 0:
-        train_loader_kwargs["prefetch_factor"] = max(int(cfg.prefetch_factor), 1)
-        train_loader_kwargs["persistent_workers"] = True
-    train_loader = DataLoader(train_dataset, **train_loader_kwargs)
 
     opt = torch.optim.AdamW(
         (p for p in model.parameters() if p.requires_grad), lr=cfg.lr, weight_decay=0.01
     )
     opt.zero_grad(set_to_none=True)
 
-    val_rows = load_jsonl(Path(cfg.val_jsonl))
-    final_val_n = (
-        len(val_rows) if cfg.val_limit <= 0 else min(cfg.val_limit, len(val_rows))
-    )
-    eval_val_n = (
-        len(val_rows)
-        if cfg.eval_val_limit <= 0
-        else min(cfg.eval_val_limit, len(val_rows))
-    )
+    train_samples_per_epoch = (len(train_rows) // cfg.micro_batch_size) * cfg.micro_batch_size
+    total_micro = cfg.epochs * (train_samples_per_epoch // cfg.micro_batch_size)
+    total_optim = max(total_micro // grad_acc, 1)
+    warmup = int(total_optim * float(cfg.lr_warmup_ratio))
 
-    eval_time_total = 0.0
-    best_eval: dict | None = None
-
-    def _save_checkpoint(save_dir: Path) -> None:
-        save_dir.mkdir(parents=True, exist_ok=True)
-        model.save_pretrained(save_dir)
-        tokenizer.save_pretrained(save_dir)
-
-    def _maybe_save_best(metrics: dict, at_optim_step: int, tag: str) -> None:
-        nonlocal best_eval
-        score = float(metrics["accuracy"])
-        if best_eval is not None and score <= best_eval["accuracy"]:
-            return
-        best_dir = Path(cfg.output_dir) / f"{cfg_name}_best"
-        _save_checkpoint(best_dir)
-        best_eval = {
-            "accuracy": score,
-            "accuracy_bbox": float(metrics["accuracy_bbox"]),
-            "accuracy_no_bbox": float(metrics["accuracy_no_bbox"]),
-            "n_total": int(metrics["n_total"]),
-            "n_bbox": int(metrics["n_bbox"]),
-            "n_no_bbox": int(metrics["n_no_bbox"]),
-            "optim_step": int(at_optim_step),
-            "tag": tag,
-            "checkpoint": str(best_dir),
-        }
-        msg = (
-            f"[best ckpt] saved @ {tag}/{at_optim_step}: "
-            f"total={score:.4f}, path={best_dir}"
-        )
-        if pbar is not None:
-            pbar.write(msg)
-        else:
-            print(msg)
-
-    def _run_eval(at_optim_step: int, n_samples: int, tag: str) -> dict:
-        nonlocal eval_time_total
-        t_eval = time.perf_counter()
-        m = val_accuracy(
-            model,
-            tokenizer,
-            val_rows,
-            image_root,
-            device,
-            max_tiles=cfg.max_tiles,
-            limit=n_samples,
-            max_new_tokens=cfg.max_new_tokens,
-            prompt_mode=cfg.prompt_mode,
-            max_bboxes=cfg.max_bboxes,
-            batch_size=cfg.eval_batch_size,
-            num_workers=cfg.num_workers,
-            prefetch_factor=cfg.prefetch_factor,
-            pin_memory=cfg.pin_memory,
-            desc=f"eval[{tag}@{at_optim_step}]",
-        )
-        eval_time_total += time.perf_counter() - t_eval
-        msg = (
-            f"[{tag} @ optim_step={at_optim_step}] "
-            f"total={m['accuracy']:.4f} (n={m['n_total']}), "
-            f"bbox={m['accuracy_bbox']:.4f} (n={m['n_bbox']}), "
-            f"no_bbox={m['accuracy_no_bbox']:.4f} (n={m['n_no_bbox']})"
-        )
-        if pbar is not None:
-            pbar.write(msg)
-        else:
-            print(msg)
-        if log_wandb:
-            import wandb
-
-            wandb.log(
-                {
-                    "val/accuracy": m["accuracy"],
-                    "val/accuracy_bbox": m["accuracy_bbox"],
-                    "val/accuracy_no_bbox": m["accuracy_no_bbox"],
-                    "val/samples": m["n_total"],
-                    "val/samples_bbox": m["n_bbox"],
-                    "val/samples_no_bbox": m["n_no_bbox"],
-                },
-                step=max(at_optim_step, 1),
-            )
-        _maybe_save_best(m, at_optim_step, tag)
-        return m
-
-    train_samples_per_epoch = (
-        len(train_rows) // cfg.micro_batch_size
-    ) * cfg.micro_batch_size
-    total_train_samples = cfg.epochs * train_samples_per_epoch
-    total_micro_steps = cfg.epochs * (train_samples_per_epoch // cfg.micro_batch_size)
-    total_optim_steps = total_micro_steps // accumulation_steps
-    warmup_steps = int(total_optim_steps * float(cfg.lr_warmup_ratio))
-    schedule_name = (cfg.lr_schedule or "constant").strip().lower()
-    if schedule_name == "constant":
-        lr_scheduler = get_constant_schedule(opt)
-    elif schedule_name == "warmup_cosine":
-        lr_scheduler = get_cosine_schedule_with_warmup(
-            opt,
-            num_warmup_steps=warmup_steps,
-            num_training_steps=max(total_optim_steps, 1),
-        )
+    if cfg.lr_schedule == "constant":
+        sched = get_constant_schedule(opt)
+    elif cfg.lr_schedule == "warmup_cosine":
+        sched = get_cosine_schedule_with_warmup(opt, warmup, total_optim)
     else:
-        raise ValueError(
-            f"未知 lr_schedule={cfg.lr_schedule!r}，仅支持 'constant' / 'warmup_cosine'"
-        )
+        raise ValueError(f"lr_schedule 不存在: {cfg.lr_schedule}")
+
+    eval_n = len(val_rows) if cfg.eval_val_limit <= 0 else min(cfg.eval_val_limit, len(val_rows))
+    final_n = len(val_rows) if cfg.val_limit <= 0 else min(cfg.val_limit, len(val_rows))
+    eval_time = 0.0
+    best = None
     pbar = tqdm(
-        total=total_train_samples,
-        desc=f"train[{cfg_name}]",
+        total=cfg.epochs * train_samples_per_epoch,
+        desc=f"train[{name}]",
         dynamic_ncols=True,
         leave=True,
     )
 
-    t0 = time.perf_counter()
-    micro_step, optim_step = 0, 0
+    def save_to(where):
+        where = Path(where)
+        where.mkdir(parents=True, exist_ok=True)
+        model.save_pretrained(where)
+        tok.save_pretrained(where)
+        return where
+
+    def keep_best(m, step, tag):
+        nonlocal best
+        if best is not None and m["accuracy"] <= best["accuracy"]:
+            return
+        where = save_to(Path(cfg.output_dir) / f"{name}_best")
+        best = {
+            "accuracy": float(m["accuracy"]),
+            "accuracy_bbox": float(m["accuracy_bbox"]),
+            "accuracy_no_bbox": float(m["accuracy_no_bbox"]),
+            "n_total": int(m["n_total"]),
+            "n_bbox": int(m["n_bbox"]),
+            "n_no_bbox": int(m["n_no_bbox"]),
+            "optim_step": int(step),
+            "tag": tag,
+            "checkpoint": str(where),
+        }
+        pbar.write(f"[best] {tag}/{step}: {m['accuracy']:.4f} -> {where}")
+
+    def run_val(step, sample_n, tag):
+        nonlocal eval_time
+        t = time.perf_counter()
+        m = eval_acc(model, tok, val_rows, cfg, image_root, device, sample_n, f"eval[{tag}@{step}]")
+        eval_time += time.perf_counter() - t
+        pbar.write(
+            f"[{tag} @ {step}] total={m['accuracy']:.4f}({m['n_total']}), "
+            f"bbox={m['accuracy_bbox']:.4f}({m['n_bbox']}), "
+            f"no_bbox={m['accuracy_no_bbox']:.4f}({m['n_no_bbox']})"
+        )
+        if log_wandb:
+            import wandb
+            wandb.log({
+                "val/accuracy": m["accuracy"],
+                "val/accuracy_bbox": m["accuracy_bbox"],
+                "val/accuracy_no_bbox": m["accuracy_no_bbox"],
+                "val/samples": m["n_total"],
+                "val/samples_bbox": m["n_bbox"],
+                "val/samples_no_bbox": m["n_no_bbox"],
+            }, step=max(step, 1))
+        keep_best(m, step, tag)
+        return m
+
+    micro = optim = 0
     last_loss = float("nan")
-    last_val: dict | None = None
-
     if cfg.eval_at_start:
-        last_val = _run_eval(0, eval_val_n, "pre-train")
+        run_val(0, eval_n, "pre")
 
-    for _ in range(cfg.epochs):
-        for batch in train_loader:
+    t0 = time.perf_counter()
+    for _epoch in range(cfg.epochs):
+        for batch in train_dl:
             pv = batch["pixel_values"].to(device=device, non_blocking=True)
             input_ids = batch["input_ids"].to(device=device, non_blocking=True)
-            attention_mask = batch["attention_mask"].to(
-                device=device, non_blocking=True
-            )
+            mask = batch["attention_mask"].to(device=device, non_blocking=True)
             labels = batch["labels"].to(device=device, non_blocking=True)
             flags = batch["image_flags"].to(device=device, non_blocking=True)
-            sample_count = int(batch["sample_count"])
+
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 out = model(
                     pixel_values=pv,
                     input_ids=input_ids,
-                    attention_mask=attention_mask,
+                    attention_mask=mask,
                     image_flags=flags,
                     labels=labels,
                     use_cache=False,
                 )
-            loss = out.loss / accumulation_steps
+            loss = out.loss / grad_acc
             loss.backward()
-            last_loss = loss.detach().float().item() * accumulation_steps
-            micro_step += 1
-            pbar.update(sample_count)
-            pbar.set_postfix(
-                loss=f"{last_loss:.4f}",
-                optim=optim_step,
-                lr=f"{opt.param_groups[0]['lr']:.2e}",
-            )
+            last_loss = float(loss.detach().float().item() * grad_acc)
+            micro += 1
 
-            if micro_step % accumulation_steps == 0:
-                nn.utils.clip_grad_norm_(
-                    [p for p in model.parameters() if p.requires_grad], 1.0
-                )
+            pbar.update(int(batch["sample_count"]))
+            pbar.set_postfix(loss=f"{last_loss:.4f}", optim=optim, lr=f"{opt.param_groups[0]['lr']:.2e}")
+
+            if micro % grad_acc == 0:
+                nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], 1.0)
                 opt.step()
-                if lr_scheduler is not None:
-                    lr_scheduler.step()
+                sched.step()
                 opt.zero_grad(set_to_none=True)
-                optim_step += 1
+                optim += 1
+
                 if log_wandb:
                     import wandb
-
-                    wandb.log(
-                        {
-                            "train/loss": last_loss,
-                            "train/micro_step": micro_step,
-                            "train/lr": opt.param_groups[0]["lr"],
-                        },
-                        step=optim_step,
-                    )
-                if cfg.eval_interval > 0 and optim_step % cfg.eval_interval == 0:
-                    last_val = _run_eval(optim_step, eval_val_n, "periodic")
-
+                    wandb.log({
+                        "train/loss": last_loss,
+                        "train/micro_step": micro,
+                        "train/lr": opt.param_groups[0]["lr"],
+                    }, step=optim)
+                if cfg.eval_interval > 0 and optim % cfg.eval_interval == 0:
+                    run_val(optim, eval_n, "periodic")
     pbar.close()
 
-    train_time = time.perf_counter() - t0 - eval_time_total
-    peak_mem_gb = torch.cuda.max_memory_allocated(device) / (1024**3)
+    train_time = time.perf_counter() - t0 - eval_time
+    peak_mem = torch.cuda.max_memory_allocated(device) / (1024 ** 3)
+    final = eval_acc(model, tok, val_rows, cfg, image_root, device, final_n, "eval[final]")
 
-    val_n = final_val_n
-    final_metrics = val_accuracy(
-        model,
-        tokenizer,
-        val_rows,
-        image_root,
-        device,
-        max_tiles=cfg.max_tiles,
-        limit=val_n,
-        max_new_tokens=cfg.max_new_tokens,
-        prompt_mode=cfg.prompt_mode,
-        max_bboxes=cfg.max_bboxes,
-        batch_size=cfg.eval_batch_size,
-        num_workers=cfg.num_workers,
-        prefetch_factor=cfg.prefetch_factor,
-        pin_memory=cfg.pin_memory,
-        desc="eval[final]",
-    )
-
-    out_dir = Path(cfg.output_dir) / cfg_name
-    _save_checkpoint(out_dir)
-    if best_eval is None:
-        _maybe_save_best(final_metrics, optim_step, "final")
+    out_dir = save_to(Path(cfg.output_dir) / name)
+    if best is None:
+        keep_best(final, optim, "final")
 
     final_lr = opt.param_groups[0]["lr"]
-    del model, tokenizer, opt
-    torch.cuda.empty_cache()
-
-    summary = {
-        "config": cfg_name,
-        "answer_accuracy": final_metrics["accuracy"],
-        "answer_accuracy_bbox": final_metrics["accuracy_bbox"],
-        "answer_accuracy_no_bbox": final_metrics["accuracy_no_bbox"],
-        "total_params": total,
-        "trainable_params": trainable,
-        "trainable_ratio_pct": ratio,
-        "peak_gpu_memory_gb": peak_mem_gb,
+    ans = {
+        "config": name,
+        "answer_accuracy": final["accuracy"],
+        "answer_accuracy_bbox": final["accuracy_bbox"],
+        "answer_accuracy_no_bbox": final["accuracy_no_bbox"],
+        "total_params": total_p,
+        "trainable_params": train_p,
+        "trainable_ratio_pct": train_ratio,
+        "peak_gpu_memory_gb": peak_mem,
         "train_time_sec": train_time,
         "checkpoint": str(out_dir),
-        "val_samples": final_metrics["n_total"],
-        "val_samples_bbox": final_metrics["n_bbox"],
-        "val_samples_no_bbox": final_metrics["n_no_bbox"],
+        "val_samples": final["n_total"],
+        "val_samples_bbox": final["n_bbox"],
+        "val_samples_no_bbox": final["n_no_bbox"],
         "batch_size": cfg.batch_size,
         "micro_batch_size": cfg.micro_batch_size,
         "prompt_mode": cfg.prompt_mode,
         "max_bboxes": cfg.max_bboxes,
-        "optim_steps": optim_step,
-        "micro_steps": micro_step,
+        "optim_steps": optim,
+        "micro_steps": micro,
         "lr_schedule": cfg.lr_schedule,
         "lr_warmup_ratio": cfg.lr_warmup_ratio,
         "final_lr": final_lr,
-        "best_checkpoint": None if best_eval is None else best_eval["checkpoint"],
-        "best_val_accuracy": None if best_eval is None else best_eval["accuracy"],
-        "best_val_accuracy_bbox": (
-            None if best_eval is None else best_eval["accuracy_bbox"]
-        ),
-        "best_val_accuracy_no_bbox": (
-            None if best_eval is None else best_eval["accuracy_no_bbox"]
-        ),
-        "best_val_samples": None if best_eval is None else best_eval["n_total"],
-        "best_at_optim_step": None if best_eval is None else best_eval["optim_step"],
-        "best_eval_tag": None if best_eval is None else best_eval["tag"],
+        "best_checkpoint": None if best is None else best["checkpoint"],
+        "best_val_accuracy": None if best is None else best["accuracy"],
+        "best_val_accuracy_bbox": None if best is None else best["accuracy_bbox"],
+        "best_val_accuracy_no_bbox": None if best is None else best["accuracy_no_bbox"],
+        "best_val_samples": None if best is None else best["n_total"],
+        "best_at_optim_step": None if best is None else best["optim_step"],
+        "best_eval_tag": None if best is None else best["tag"],
     }
+
     if log_wandb:
         import wandb
+        wandb.log({
+            "val/accuracy": final["accuracy"],
+            "val/accuracy_bbox": final["accuracy_bbox"],
+            "val/accuracy_no_bbox": final["accuracy_no_bbox"],
+            "val/samples": final["n_total"],
+            "val/samples_bbox": final["n_bbox"],
+            "val/samples_no_bbox": final["n_no_bbox"],
+            "model/trainable_params": train_p,
+            "model/trainable_ratio_pct": train_ratio,
+            "train/lr": final_lr,
+            "sys/peak_gpu_memory_gb": peak_mem,
+            "train/wall_time_sec": train_time,
+            "train/optim_steps": optim,
+            "train/micro_steps": micro,
+        }, step=max(optim, 1))
 
-        wandb.log(
-            {
-                "val/accuracy": final_metrics["accuracy"],
-                "val/accuracy_bbox": final_metrics["accuracy_bbox"],
-                "val/accuracy_no_bbox": final_metrics["accuracy_no_bbox"],
-                "val/samples": final_metrics["n_total"],
-                "val/samples_bbox": final_metrics["n_bbox"],
-                "val/samples_no_bbox": final_metrics["n_no_bbox"],
-                "model/trainable_params": trainable,
-                "model/trainable_ratio_pct": ratio,
-                "train/lr": final_lr,
-                "sys/peak_gpu_memory_gb": peak_mem_gb,
-                "train/wall_time_sec": train_time,
-                "train/optim_steps": optim_step,
-                "train/micro_steps": micro_step,
-            },
-            step=max(optim_step, 1),
-        )
-    return summary
+    del model, tok, opt
+    torch.cuda.empty_cache()
+    return ans
 
 
-FREEZE_CONFIGS = {
-    "A_connector_only": dict(
-        train_vision=False, train_connector=True, train_language=False
-    ),
-    "B_connector_language": dict(
-        train_vision=False, train_connector=True, train_language=True
-    ),
-    "C_vision_connector": dict(
-        train_vision=True, train_connector=True, train_language=False
-    ),
+FREEZE = {
+    "A_connector_only": dict(train_vision=False, train_connector=True, train_language=False),
+    "B_connector_language": dict(train_vision=False, train_connector=True, train_language=True),
+    "C_vision_connector": dict(train_vision=True, train_connector=True, train_language=False),
     "D_full": dict(train_vision=True, train_connector=True, train_language=True),
 }
 
 
-def main() -> None:
-    # Task3 visual experiment configs:
-    # 1) same_box:
-    #    train_jsonl = outputs/task3/visual_data/same_box/train.jsonl
-    #    val_jsonl   = outputs/task3/visual_data/same_box/val.jsonl
-    #    image_root  = ROOT
-    #    prompt_mode = "no_bbox"
-    # 2) color_box:
-    #    train_jsonl = outputs/task3/visual_data/color_box/train.jsonl
-    #    val_jsonl   = outputs/task3/visual_data/color_box/val.jsonl
-    #    image_root  = ROOT
-    #    prompt_mode = "no_bbox"
-    # 3) color_box_label:
-    #    train_jsonl = outputs/task3/visual_data/color_box_label/train.jsonl
-    #    val_jsonl   = outputs/task3/visual_data/color_box_label/val.jsonl
-    #    image_root  = ROOT
-    #    prompt_mode = "no_bbox"
-    # 4) same_box_bbox_prompt:
-    #    train_jsonl = outputs/task3/visual_data/same_box/train.jsonl
-    #    val_jsonl   = outputs/task3/visual_data/same_box/val.jsonl
-    #    image_root  = ROOT
-    #    prompt_mode = "bbox_prompt"
-    # 5) color_box_color_prompt:
-    #    train_jsonl = outputs/task3/visual_data/color_box/train.jsonl
-    #    val_jsonl   = outputs/task3/visual_data/color_box/val.jsonl
-    #    image_root  = ROOT
-    #    prompt_mode = "color_bbox_prompt"
-    cfg = SimpleNamespace(
+def cfg_here():
+    return NS(
         # model_path=str(ROOT / "data/models/InternVL2-2B"),
         model_path=str(
             ROOT
@@ -774,28 +559,28 @@ def main() -> None:
         wandb_run_prefix="task3-baseonhard13-epoch2",
     )
 
+
+def main():
+    cfg = cfg_here()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if device.type != "cuda":
         raise RuntimeError("no cuda")
 
     name = cfg.freeze_config
-    if name not in FREEZE_CONFIGS:
-        raise ValueError(
-            f"未知 freeze_config={name!r}，请填 {list(FREEZE_CONFIGS)!r} 之一。"
-        )
-    train_cfg = FREEZE_CONFIGS[name]
+    if name not in FREEZE:
+        raise ValueError(f"freeze_config 写错了: {name}; 可选 {list(FREEZE)}")
+    bits = FREEZE[name]
     image_root = Path(cfg.image_root).resolve()
 
     if cfg.use_wandb:
         import wandb
-
-        prefix = (cfg.wandb_run_prefix or "task1").strip() or "task1"
+        run_prefix = (cfg.wandb_run_prefix or "task1").strip() or "task1"
         wandb.init(
             project=cfg.wandb_project,
-            name=f"{prefix}_{name}",
+            name=f"{run_prefix}_{name}",
             config={
                 "freeze_config": name,
-                **train_cfg,
+                **bits,
                 "epochs": cfg.epochs,
                 "lr": cfg.lr,
                 "batch_size": cfg.batch_size,
@@ -822,15 +607,14 @@ def main() -> None:
                 "image_root": cfg.image_root,
             },
         )
-    summ: dict | None = None
+
+    summ = None
     try:
-        summ = train_one_config(
-            name, train_cfg, cfg, device, image_root, log_wandb=cfg.use_wandb
-        )
+        summ = run_one(name, bits, cfg, device, image_root, log_wandb=cfg.use_wandb)
     finally:
         if summ is not None:
             print(
-                f"Answer Accuracy (val):\n"
+                "Answer Accuracy (val):\n"
                 f"  total   = {summ['answer_accuracy']:.4f} (n={summ['val_samples']})\n"
                 f"  bbox    = {summ['answer_accuracy_bbox']:.4f} (n={summ['val_samples_bbox']})\n"
                 f"  no_bbox = {summ['answer_accuracy_no_bbox']:.4f} (n={summ['val_samples_no_bbox']})\n"
@@ -840,13 +624,13 @@ def main() -> None:
                 f"Train wall time: {summ['train_time_sec']:.1f} s\n"
                 f"Saved: {summ['checkpoint']}"
             )
-            Path(cfg.output_dir).mkdir(parents=True, exist_ok=True)
-            metrics_path = Path(cfg.output_dir) / "task1_metrics.json"
-            metrics_path.write_text(json.dumps([summ], indent=2), encoding="utf-8")
-            print(f"\nWrote {metrics_path}")
+            out = Path(cfg.output_dir)
+            out.mkdir(parents=True, exist_ok=True)
+            fn = out / "task1_metrics.json"
+            fn.write_text(json.dumps([summ], indent=2), encoding="utf-8")
+            print(f"\nWrote {fn}")
         if cfg.use_wandb:
             import wandb
-
             wandb.finish()
 
 

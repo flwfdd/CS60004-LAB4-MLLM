@@ -1,45 +1,10 @@
-"""
-VQA 评测脚本：在验证集或测试集上运行 InternVL2-2B 或 Qwen3-VL-8B-Instruct 推理，
-并计算 Answer Accuracy（精确匹配）。
-
-支持两种模式：
-  no_bbox     仅输入图像 + 问题（Task 1 / Task 2 评测）
-  bbox_prompt 将 bbox 坐标文字化后拼入 prompt（Task 3 参考）
-
-运行示例：
-  # Task 1/2 验证集评测（InternVL2-2B，微调后的权重）
-  python scripts/evaluate_vqa.py \\
-      --model internvl2 \\
-      --model-path /path/to/your/finetuned_model \\
-      --dataset data/task1/val.jsonl \\
-      --mode no_bbox \\
-      --output results/val_no_bbox.jsonl
-
-  # Task 3 验证集评测（带 bbox 文字 prompt）
-  python scripts/evaluate_vqa.py \\
-      --model internvl2 \\
-      --model-path /path/to/your/finetuned_model \\
-      --dataset data/task1/val.jsonl \\
-      --mode bbox_prompt \\
-      --output results/val_bbox_prompt.jsonl
-
-  # 生成 Leaderboard 提交文件（测试集无答案，只输出预测）
-  python scripts/evaluate_vqa.py \\
-      --model internvl2 \\
-      --model-path /path/to/your/finetuned_model \\
-      --dataset data/task1/test.jsonl \\
-      --mode no_bbox \\
-      --output results/submission.jsonl
-"""
-
 from __future__ import annotations
 
 import argparse
 import json
 import re
-from collections import Counter
 from pathlib import Path
-from typing import Any, Callable, cast
+from typing import Any
 
 import torch
 from torch.utils.data import DataLoader, Dataset
@@ -91,17 +56,24 @@ def extract_prediction(text: str, mode: str) -> str:
     if mode != "cot":
         return text
 
-    matches = re.findall(r"Answer\s*[:：]\s*(.+)", text, flags=re.I)
-    if matches:
-        return matches[-1].splitlines()[0].strip().strip("\"'`.,。")
     lines = [line.strip() for line in text.splitlines() if line.strip()]
+    for line in reversed(lines):
+        low = line.lower()
+        if low.startswith("answer:") or low.startswith("answer："):
+            return line.split(":", 1)[-1].split("：", 1)[-1].strip().strip("\"'`.,。")
     return lines[-1].strip("\"'`.,。") if lines else text
 
 
 def vote_predictions(raw_predictions: list[str], mode: str) -> tuple[str, list[str]]:
     predictions = [extract_prediction(pred, mode) for pred in raw_predictions]
-    counts = Counter(normalize(pred) for pred in predictions)
-    best_norm, _ = counts.most_common(1)[0]
+    counts = {}
+    best_norm = ""
+    best_count = 0
+    for pred in predictions:
+        key = normalize(pred)
+        counts[key] = counts.get(key, 0) + 1
+        if counts[key] > best_count:
+            best_norm, best_count = key, counts[key]
     for pred in predictions:
         if normalize(pred) == best_norm:
             return pred, predictions
@@ -111,16 +83,33 @@ def vote_predictions(raw_predictions: list[str], mode: str) -> tuple[str, list[s
 # ── Prompt 构造 ───────────────────────────────────────────────────────────────
 
 
+def _bbox_lines(
+    row: dict[str, Any], max_bboxes: int, *, color: bool, coords: bool
+) -> list[str]:
+    lines = ["Objects in the image:"]
+    for i, b in enumerate(row.get("bboxes", [])[:max_bboxes], start=1):
+        name = b["category"]
+        if color:
+            box_color = b.get("color", f"box {i}")
+            name = f"{box_color} box: {name}"
+        prefix = f"{i}. {name}"
+        if coords:
+            sep = "," if color else ":"
+            prefix += f"{sep} normalized_bbox={b['bbox']}"
+        lines.append(prefix)
+    return lines
+
+
 def build_prompt(row: dict[str, Any], mode: str, max_bboxes: int) -> str:
     format_prompt = "The answer must be a simple short answer, usually one word, a short phrase, yes/no, or a number."
     question = row["question"].strip()
     if mode == "cot":
         prefix = ""
         if row.get("bboxes"):
-            lines = ["Objects in the image:"]
-            for i, b in enumerate(row["bboxes"][:max_bboxes], start=1):
-                lines.append(f"{i}. {b['category']}: normalized_bbox={b['bbox']}")
-            prefix = "\n".join(lines) + "\n\n"
+            prefix = (
+                "\n".join(_bbox_lines(row, max_bboxes, color=False, coords=True))
+                + "\n\n"
+            )
         return (
             f"{prefix}Question: {question}\n"
             "Answer the question by reasoning briefly from the image and the "
@@ -134,26 +123,13 @@ def build_prompt(row: dict[str, Any], mode: str, max_bboxes: int) -> str:
             "Answer: <short answer>"
         )
     if mode == "bbox_prompt" and row.get("bboxes"):
-        lines = ["Objects in the image:"]
-        for i, b in enumerate(row["bboxes"][:max_bboxes], start=1):
-            lines.append(f"{i}. {b['category']}: normalized_bbox={b['bbox']}")
-        bbox_ctx = "\n".join(lines)
+        bbox_ctx = "\n".join(_bbox_lines(row, max_bboxes, color=False, coords=True))
         return f"{bbox_ctx}\n\nQuestion: {question}\nAnswer with the shortest correct answer only. {format_prompt}"
     if mode == "color_prompt" and row.get("bboxes"):
-        lines = ["Objects in the image:"]
-        for i, b in enumerate(row["bboxes"][:max_bboxes], start=1):
-            color = b.get("color", f"box {i}")
-            lines.append(f"{i}. {color} box: {b['category']}")
-        bbox_ctx = "\n".join(lines)
+        bbox_ctx = "\n".join(_bbox_lines(row, max_bboxes, color=True, coords=False))
         return f"{bbox_ctx}\n\nQuestion: {question}\nAnswer with the shortest correct answer only. {format_prompt}"
     if mode == "color_bbox_prompt" and row.get("bboxes"):
-        lines = ["Objects in the image:"]
-        for i, b in enumerate(row["bboxes"][:max_bboxes], start=1):
-            color = b.get("color", f"box {i}")
-            lines.append(
-                f"{i}. {color} box: {b['category']}, normalized_bbox={b['bbox']}"
-            )
-        bbox_ctx = "\n".join(lines)
+        bbox_ctx = "\n".join(_bbox_lines(row, max_bboxes, color=True, coords=True))
         return f"{bbox_ctx}\n\nQuestion: {question}\nAnswer with the shortest correct answer only. {format_prompt}"
     return f"Question: {question}\nAnswer with the shortest correct answer only. {format_prompt}"
 
@@ -188,9 +164,7 @@ def internvl_dynamic_tile_pixel_values(
     max_tiles: int = 6,
     image_size: int = 448,
 ) -> torch.Tensor:
-    transform = cast(
-        Callable[[Image.Image], torch.Tensor], _internvl_tile_transform(image_size)
-    )
+    transform = _internvl_tile_transform(image_size)
     w, h = image.size
     ratio = w / h
     sz = image_size

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import re
 from pathlib import Path
 
 import torch
@@ -138,25 +137,49 @@ class QwenTeacher:
 
 
 def parse_json_list(text: str) -> list[dict]:
-    text = re.sub(r"^```(?:json)?|```$", "", text.strip(), flags=re.MULTILINE).strip()
+    text = text.strip()
+    if text.startswith("```"):
+        lines = text.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        text = "\n".join(lines).strip()
+
     if not text.startswith("["):
-        match = re.search(r"\[.*\]", text, flags=re.S)
-        text = match.group(0) if match else text
+        left = text.find("[")
+        right = text.rfind("]")
+        if left != -1 and right != -1 and left < right:
+            text = text[left : right + 1]
     data = json.loads(text)
     return data if isinstance(data, list) else []
+
+
+def leaks_bbox(question: str) -> bool:
+    s = question.lower()
+    for word in ("bbox", "bounding box", "x_min", "y_min", "xmax", "ymax"):
+        if word in s:
+            return True
+
+    # 识别 [0.1, 0.2, 0.3, 0.4] 形式的 bbox
+    for part in s.split("[")[1:]:
+        part = part.split("]", 1)[0]
+        nums = [x.strip() for x in part.split(",")]
+        if len(nums) >= 4 and all(x.replace(".", "", 1).isdigit() for x in nums[:4]):
+            return True
+    return False
 
 
 def clean_items(items: list[dict]) -> list[dict]:
     rows = []
     seen = set()
-    bad_pattern = re.compile(r"bbox|bounding box|\[[0-9.,\s]+\]|x_min|y_min", re.I)
     for item in items:
         inst = str(item.get("question", "")).strip()
         out = str(item.get("answer", "")).strip()
         task_type = str(item.get("task_type", "")).strip()
         if task_type not in TASK_TYPES:
             continue
-        if not inst or not out or bad_pattern.search(inst):
+        if not inst or not out or leaks_bbox(inst):
             continue
         key = (task_type, inst.lower())
         if key in seen:
